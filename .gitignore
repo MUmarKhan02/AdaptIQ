@@ -1,0 +1,6 @@
+api key.txt
+__pycache__/
+*.pyc
+node_modules/
+.env
+*.log
