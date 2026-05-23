@@ -62,10 +62,11 @@ function CircleProgress({ percent }) {
 }
 
 export default function LoadingScreen({ resumeFilename, jobText, genCover, onComplete, onError, onNavigateBack }) {
-  const [progress, setProgress]   = useState(0)
-  const [done, setDone]           = useState(false)
-  const [elapsed, setElapsed]     = useState(0)
-  const [finalTime, setFinalTime] = useState(null)
+  const [progress, setProgress]       = useState(0)
+  const [done, setDone]               = useState(false)
+  const [elapsed, setElapsed]         = useState(0)
+  const [finalTime, setFinalTime]     = useState(null)
+  const [rateLimitSecs, setRateLimit] = useState(null) // non-null = rate limited
 
   const progressRef  = useRef(0)
   const finishedRef  = useRef(false)
@@ -110,6 +111,17 @@ export default function LoadingScreen({ resumeFilename, jobText, genCover, onCom
     const t = setInterval(() => setElapsed(s => s + 1), 1000)
     return () => clearInterval(t)
   }, [done])
+
+  // Rate limit countdown — go back once expired
+  useEffect(() => {
+    if (rateLimitSecs === null) return
+    if (rateLimitSecs <= 0) {
+      onError('Rate limit hit — please try again.')
+      return
+    }
+    const t = setInterval(() => setRateLimit(s => s - 1), 1000)
+    return () => clearInterval(t)
+  }, [rateLimitSecs])
 
   useEffect(() => {
     if (hasFired.current) return
@@ -162,7 +174,10 @@ export default function LoadingScreen({ resumeFilename, jobText, genCover, onCom
 
         const res = await fetch('/api/tailor-resume', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            ...(localStorage.getItem('adaptiq_token') ? { 'X-Auth-Token': localStorage.getItem('adaptiq_token') } : {}),
+          },
           body: JSON.stringify({
             resume_filename: resumeFilename,
             job_text: jobText,
@@ -170,6 +185,21 @@ export default function LoadingScreen({ resumeFilename, jobText, genCover, onCom
           }),
           signal: abortRef.current.signal,
         })
+
+        if (res.status === 429) {
+          const text = await res.text()
+          let retryAfter = 60
+          try {
+            const parsed = JSON.parse(text)
+            const detail = typeof parsed.detail === 'string' ? JSON.parse(parsed.detail) : parsed.detail
+            retryAfter = detail?.retry_after ?? 60
+          } catch {}
+          clearInterval(ticker)
+          finishedRef.current = true
+          if (animFrameRef.current) clearInterval(animFrameRef.current)
+          setRateLimit(retryAfter)
+          return
+        }
 
         if (!res.ok) {
           const text = await res.text()
@@ -217,13 +247,47 @@ export default function LoadingScreen({ resumeFilename, jobText, genCover, onCom
     : stage.label
   const displayDetail = done ? 'Opening your results…' : stage.detail
 
+  // Rate limit screen
+  if (rateLimitSecs !== null) {
+    return (
+      <div style={styles.layout}>
+        <header style={styles.header}>
+          <div style={styles.headerInner}>
+            <div style={styles.logo}>
+              <img src="/AdaptIQ_Logo.png" alt="AdaptIQ" style={{ height: 28, width: 'auto' }} />
+              <span style={styles.logoText}>Adapt<em style={styles.logoAccent}>IQ</em></span>
+            </div>
+          </div>
+        </header>
+        <main style={{ ...styles.main, gap: 24 }}>
+          <div style={{ fontSize: 48 }}>⏱</div>
+          <div style={styles.textBlock}>
+            <p style={{ ...styles.stageLabel, color: '#f0a500' }}>Gemini rate limit reached</p>
+            <p style={styles.stageDetail}>Too many requests — the API is cooling down.</p>
+            <p style={{ fontSize: 13, color: 'var(--text-secondary)', fontFamily: 'var(--font-mono)', marginTop: 8 }}>
+              {rateLimitSecs > 0
+                ? <>Returning automatically in <strong style={{ color: 'var(--text-primary)' }}>{rateLimitSecs}s</strong></>
+                : 'Returning now…'}
+            </p>
+          </div>
+          <button
+            onClick={() => onError('Rate limit hit — please try again.')}
+            style={{ padding: '10px 24px', background: 'var(--surface-raised)', border: '1px solid var(--border)', borderRadius: 'var(--radius)', color: 'var(--text-primary)', cursor: 'pointer', fontFamily: 'var(--font-body)', fontSize: 14 }}
+          >
+            Go back now
+          </button>
+        </main>
+      </div>
+    )
+  }
+
   return (
     <div style={styles.layout}>
       <header style={styles.header}>
         <div style={styles.headerInner}>
           <div style={styles.logo}>
-            <span style={styles.logoIcon}>⌂</span>
-            <span style={styles.logoText}>resume<em style={styles.logoAccent}>tailor</em></span>
+            <img src="/AdaptIQ_Logo.png" alt="AdaptIQ" style={{ height: 28, width: 'auto' }} />
+            <span style={styles.logoText}>Adapt<em style={styles.logoAccent}>IQ</em></span>
           </div>
           <span style={styles.headerTag}>personal workspace</span>
         </div>
@@ -274,7 +338,7 @@ const styles = {
   logo:        { display: 'flex', alignItems: 'center', gap: 8 },
   logoIcon:    { fontSize: 18, color: 'var(--accent)' },
   logoText:    { fontFamily: 'var(--font-display)', fontSize: 20, color: 'var(--text-primary)', letterSpacing: '-0.02em' },
-  logoAccent:  { fontStyle: 'italic', color: 'var(--accent)' },
+  logoAccent:  { fontStyle: 'normal', background: 'var(--accent-gradient)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent', backgroundClip: 'text' },
   headerTag:   { fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--text-muted)', letterSpacing: '0.08em', textTransform: 'uppercase' },
   main:        { flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 40, padding: '60px 24px' },
   circleWrap:  { position: 'relative', width: 220, height: 220, display: 'flex', alignItems: 'center', justifyContent: 'center' },

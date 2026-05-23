@@ -1,0 +1,23 @@
+Project Scanner Report
+Generated: 2026-05-17 5:53:23 PM
+Project Path: C:\Users\Umar_\Coding-Languages\AI_Projects\Resume_Job_Creator_Gemini
+==================================================
+
+Stack Detected: Node.js / JavaScript + Python
+
+How to run this project:
+==================================================
+  Step 1: Open a terminal in the project folder
+  Step 2: Run: npm install
+  Step 3: Run: npm run dev
+  Step 4: Run: npm run build
+  Step 5: Run: npm run preview
+  Step 6: Run: pip install -r requirements.txt
+  Step 7: Run: python main.py
+
+Requires 2 terminal(s):
+  Terminal 1: npm run dev
+  Terminal 2: python main.py
+
+Ports:
+  http://localhost:3000  (from vite.config)

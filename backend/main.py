@@ -1,6 +1,9 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Request
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+import hmac
+import hashlib
+import base64
 from contextlib import asynccontextmanager
 import shutil
 import os
@@ -17,12 +20,41 @@ import httpx
 from bs4 import BeautifulSoup
 import pdfplumber
 
+
+from dotenv import load_dotenv
+load_dotenv()
+# ── Auth ──────────────────────────────────────────────────────────────────────
+_AUTH_PASSWORD     = os.environ.get("ADAPTIQ_PASSWORD", "changeme")
+_AUTH_SECRET       = os.environ.get("ADAPTIQ_SECRET",   "adaptiq-secret-key-change-me")
+_TOKEN_EXPIRY_DAYS = 30
+_UNPROTECTED_PATHS = {"/", "/api/auth/login", "/api/gemini-quota"}
+_UNPROTECTED_PREFIXES = ("/api/download/", "/api/download-cl/")
+
+def _sign_token(payload: str) -> str:
+    sig = hmac.new(_AUTH_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    return base64.urlsafe_b64encode(f"{payload}.{sig}".encode()).decode()
+
+def _verify_token(token: str) -> bool:
+    try:
+        decoded = base64.urlsafe_b64decode(token.encode()).decode()
+        payload, sig = decoded.rsplit(".", 1)
+        expected = hmac.new(_AUTH_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expected):
+            return False
+        return datetime.utcnow() < datetime.fromisoformat(payload)
+    except Exception:
+        return False
+
+def _make_token() -> str:
+    expiry = (datetime.utcnow() + timedelta(days=_TOKEN_EXPIRY_DAYS)).isoformat()
+    return _sign_token(expiry)
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     asyncio.create_task(_purge_loop())
     yield
 
-app = FastAPI(title="Resume Tailor API", lifespan=lifespan)
+app = FastAPI(title="AdaptIQ API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -31,6 +63,19 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    path = request.url.path
+    if request.method == "OPTIONS" or path in _UNPROTECTED_PATHS:
+        return await call_next(request)
+    if any(path.startswith(p) for p in _UNPROTECTED_PREFIXES):
+        return await call_next(request)
+    if path.startswith("/api/"):
+        token = request.headers.get("X-Auth-Token") or request.cookies.get("adaptiq_token")
+        if not token or not _verify_token(token):
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+    return await call_next(request)
 
 UPLOAD_DIR    = Path("uploads")
 OUTPUT_DIR    = Path("outputs")
@@ -135,10 +180,12 @@ GEMINI_URL     = (
 # ── Gemini quota tracker (in-memory, resets at midnight) ──────────────────
 # Gemini 2.5 Flash free tier: 1500 requests/day, 10 RPM
 GEMINI_DAILY_LIMIT = 1500
+GEMINI_RPM_LIMIT   = 10
 
 _quota = {
-    "date":  datetime.now().date(),
-    "used":  0,
+    "date":         datetime.now().date(),
+    "used":         0,
+    "minute_calls": [],  # timestamps of calls in the last 60 seconds
 }
 
 def _quota_reset_if_new_day():
@@ -150,21 +197,38 @@ def _quota_reset_if_new_day():
 def quota_increment():
     _quota_reset_if_new_day()
     _quota["used"] += 1
+    now = datetime.now()
+    _quota["minute_calls"].append(now)
+    cutoff = now - timedelta(seconds=60)
+    _quota["minute_calls"] = [t for t in _quota["minute_calls"] if t > cutoff]
 
 def quota_snapshot() -> dict:
     _quota_reset_if_new_day()
+    now       = datetime.now()
     used      = _quota["used"]
     remaining = max(0, GEMINI_DAILY_LIMIT - used)
-    # seconds until midnight
-    now       = datetime.now()
     midnight  = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
     secs_left = int((midnight - now).total_seconds())
+    # RPM
+    cutoff = now - timedelta(seconds=60)
+    _quota["minute_calls"] = [t for t in _quota["minute_calls"] if t > cutoff]
+    rpm_used      = len(_quota["minute_calls"])
+    rpm_remaining = max(0, GEMINI_RPM_LIMIT - rpm_used)
+    if _quota["minute_calls"]:
+        oldest      = min(_quota["minute_calls"])
+        rpm_reset_s = max(0, int(60 - (now - oldest).total_seconds()) + 1)
+    else:
+        rpm_reset_s = 0
     return {
-        "used":        used,
-        "remaining":   remaining,
-        "limit":       GEMINI_DAILY_LIMIT,
-        "resets_in_s": secs_left,
-        "resets_at":   midnight.isoformat(),
+        "used":          used,
+        "remaining":     remaining,
+        "limit":         GEMINI_DAILY_LIMIT,
+        "resets_in_s":   secs_left,
+        "resets_at":     midnight.isoformat(),
+        "rpm_used":      rpm_used,
+        "rpm_remaining": rpm_remaining,
+        "rpm_limit":     GEMINI_RPM_LIMIT,
+        "rpm_reset_s":   rpm_reset_s,
     }
 
 @app.get("/api/gemini-quota")
@@ -277,6 +341,45 @@ def is_likely_job_url(url: str, html: str, title: str) -> tuple[bool, str]:
 
 
 def extract_job_body(soup: BeautifulSoup) -> str:
+    """Extract job description text from a parsed HTML page.
+    
+    Strategy:
+    1. Try JSON-LD structured data (JobPosting schema) — server-rendered even on
+       JS-heavy sites like RBC, LinkedIn, Greenhouse. Most reliable.
+    2. Try known CSS selectors for job description containers.
+    3. Fall back to full page text.
+    """
+    import json as _json
+
+    # ── Strategy 1: JSON-LD JobPosting schema ────────────────────────────────
+    for script_tag in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = _json.loads(script_tag.string or "")
+            # Handle both single objects and arrays
+            if isinstance(data, list):
+                data = next((d for d in data if d.get("@type") == "JobPosting"), None)
+            if isinstance(data, dict) and data.get("@type") == "JobPosting":
+                parts = []
+                if data.get("title"):
+                    parts.append(data["title"])
+                if data.get("description"):
+                    # Strip HTML tags from the description field
+                    desc_soup = BeautifulSoup(data["description"], "html.parser")
+                    parts.append(desc_soup.get_text(separator=" ", strip=True))
+                if data.get("qualifications"):
+                    parts.append(data["qualifications"])
+                if data.get("responsibilities"):
+                    parts.append(data["responsibilities"])
+                if data.get("skills"):
+                    parts.append(str(data["skills"]))
+                combined = " ".join(parts).strip()
+                if len(combined) > 300:
+                    combined = re.sub(r"\s{2,}", " ", combined)
+                    return combined[:6000]
+        except Exception:
+            continue
+
+    # ── Strategy 2: CSS selectors ────────────────────────────────────────────
     for tag in soup(["script", "style", "nav", "footer", "header",
                      "aside", "noscript", "iframe", "form"]):
         tag.decompose()
@@ -285,7 +388,8 @@ def extract_job_body(soup: BeautifulSoup) -> str:
         "[class*='job-description']", "[class*='jobDescription']",
         "[class*='job-content']",     "[class*='jobContent']",
         "[class*='description']",     "[id*='job-description']",
-        "[id*='jobDescription']",     "article", "main",
+        "[id*='jobDescription']",     "[class*='posting']",
+        "[class*='job-detail']",      "article", "main",
     ]
     body_text = ""
     for sel in candidate_selectors:
@@ -295,16 +399,52 @@ def extract_job_body(soup: BeautifulSoup) -> str:
             if len(body_text) > 300:
                 break
 
+    # ── Strategy 3: full page text ───────────────────────────────────────────
     if not body_text:
         body_text = soup.get_text(separator=" ", strip=True)
 
     body_text = re.sub(r"\s{2,}", " ", body_text).strip()
-    return body_text[:4000]
+    return body_text[:6000]
+
+
+MIN_JOB_BODY_LENGTH = 400  # chars — below this the page is likely JS-rendered or expired
+
+def assess_body_quality(body_text: str) -> tuple[bool, str]:
+    """Check if scraped body text is rich enough to extract meaningful keywords.
+    Returns (is_good_enough, user_facing_message)."""
+    if len(body_text) < MIN_JOB_BODY_LENGTH:
+        return False, (
+            "The job page didn't return enough content — it may require JavaScript to load "
+            "(common on RBC, Workday, and some LinkedIn pages). "
+            "Please copy and paste the full job description text instead."
+        )
+    # Check for job-like vocabulary — at least a few role-relevant words
+    job_vocab = ["experience", "skills", "responsibilities", "qualifications",
+                 "requirements", "role", "position", "team", "develop", "manage"]
+    hits = sum(1 for w in job_vocab if w in body_text.lower())
+    if hits < 2:
+        return False, (
+            "The page content doesn't look like a job description. "
+            "Please paste the job description text directly."
+        )
+    return True, ""
 
 
 @app.get("/")
 def root():
-    return {"message": "Resume Tailor API is running"}
+    return {"message": "AdaptIQ API is running"}
+
+@app.post("/api/auth/login")
+async def login(payload: dict):
+    password = payload.get("password", "")
+    if not hmac.compare_digest(password, _AUTH_PASSWORD):
+        raise HTTPException(status_code=401, detail="Invalid password")
+    token = _make_token()
+    return {"token": token, "expires_days": _TOKEN_EXPIRY_DAYS}
+
+@app.post("/api/auth/logout")
+async def logout():
+    return {"ok": True}
 
 
 @app.post("/api/fetch-job-url")
@@ -352,6 +492,10 @@ async def fetch_job_url(payload: dict):
         raise HTTPException(status_code=422, detail=reason)
 
     body_text = extract_job_body(soup)
+
+    is_good, quality_msg = assess_body_quality(body_text)
+    if not is_good:
+        raise HTTPException(status_code=422, detail=quality_msg)
 
     return {
         "success":     True,
@@ -412,11 +556,25 @@ async def tailor_resume(payload: dict):
             raise HTTPException(status_code=500, detail="Could not extract text from the resume PDF.")
 
         def extract_plain_section_bullets(section_title: str, text: str) -> list[str]:
+            """Extract bullets from a plain-bullet section.
+
+            Handles two layouts produced by pdfplumber:
+            1. SUMMARY — wrapped prose: join continuation lines into one paragraph.
+            2. SKILLS SUMMARY — two items per physical line separated by ' • ':
+               e.g. '• Item A • Item B'  →  ['Item A', 'Item B']
+               Also handles wrapped items like:
+               '• Microsoft Excel (sorting, filtering, formulas, data • Attention to detail'
+               'validation) • Inventory awareness'
+               →  ['Microsoft Excel (sorting, filtering, formulas, data validation)', 'Attention to detail', 'Inventory awareness']
+            """
             lines = [line.rstrip() for line in text.splitlines()]
             title_norm = section_title.strip().upper()
-            captured: list[str] = []
+            is_summary_section    = "SUMMARY" in title_norm and "SKILL" not in title_norm
+            is_skills_summary     = "SKILLS" in title_norm and "SUMMARY" in title_norm
+            raw_lines: list[str] = []
             collecting = False
             blank_count = 0
+
             for line in lines:
                 stripped = line.strip()
                 if collecting:
@@ -426,27 +584,203 @@ async def tailor_resume(payload: dict):
                             break
                         continue
                     blank_count = 0
-                    # Stop if we hit a new all-caps section header (4+ chars, no lowercase)
                     if len(stripped) >= 4 and stripped == stripped.upper() and re.match(r"^[A-Z][A-Z0-9 &/\-]+$", stripped):
                         break
-                    # Strip leading bullet characters before storing
-                    clean = re.sub(r"^[\u2022\u2023\u25E6\-\*]\s*", "", stripped).strip()
-                    clean = re.sub(r"^•\s*", "", clean).strip()
-                    if clean:
-                        captured.append(clean)
+                    raw_lines.append(stripped)
                 elif stripped.upper() == title_norm:
                     collecting = True
+
+            if not raw_lines:
+                return []
+
+            # ── SKILLS SUMMARY: interleaved "• left • right" layout ────────────
+            if is_skills_summary:
+                # Step 1: join physical continuation lines (lines not starting with •)
+                joined: list[str] = []
+                for raw in raw_lines:
+                    if not raw.lstrip().startswith("•") and joined:
+                        joined[-1] = joined[-1].rstrip() + " " + raw.strip()
+                    else:
+                        joined.append(raw)
+
+                # Step 2: parse each joined line with a paren-aware • splitter.
+                # Handles the edge case where the two-column layout places a column
+                # separator • inside an open paren, e.g.:
+                # "• Excel (sorting, data • Attention to detail validation) • Inventory"
+                # → ["Excel (sorting, data validation)", "Attention to detail", "Inventory"]
+                def _parse_skills_line(ln: str) -> list[str]:
+                    ln = re.sub(r"^\s*•\s*", "", ln)
+                    result_parts: list[str] = []
+                    ln_depth = 0
+                    ln_current: list[str] = []
+                    ki = 0
+                    while ki < len(ln):
+                        ch = ln[ki]
+                        if ch == "(":
+                            ln_depth += 1
+                            ln_current.append(ch)
+                            ki += 1
+                        elif ch == ")":
+                            ln_depth = max(0, ln_depth - 1)
+                            ln_current.append(ch)
+                            ki += 1
+                        elif ch == "•":
+                            if ln_depth == 0:
+                                chunk = "".join(ln_current).strip()
+                                if chunk:
+                                    result_parts.append(chunk)
+                                ln_current = []
+                                ki += 1
+                                while ki < len(ln) and ln[ki] == " ":
+                                    ki += 1
+                            else:
+                                # Trapped • inside open paren — column separator artifact.
+                                # Scan to matching ')'; split content into:
+                                #   closing_word  → belongs to left item's paren list
+                                #   right_item    → is the right-column skill
+                                ki += 1
+                                while ki < len(ln) and ln[ki] == " ":
+                                    ki += 1
+                                between: list[str] = []
+                                while ki < len(ln) and ln[ki] != ")":
+                                    between.append(ln[ki])
+                                    ki += 1
+                                ki += 1  # skip the ')'
+                                ln_depth = max(0, ln_depth - 1)
+                                bw_words = "".join(between).strip().split()
+                                closing_word = bw_words[-1] if bw_words else ""
+                                right_item   = " ".join(bw_words[:-1]) if len(bw_words) >= 2 else ""
+                                if closing_word:
+                                    ln_current.append(" ")
+                                    ln_current.extend(list(closing_word))
+                                ln_current.append(")")
+                                left = re.sub(r"  +", " ", "".join(ln_current).strip())
+                                if left:
+                                    result_parts.append(left)
+                                ln_current = []
+                                if right_item:
+                                    result_parts.append(right_item.strip())
+                                while ki < len(ln) and ln[ki] == " ":
+                                    ki += 1
+                        else:
+                            ln_current.append(ch)
+                            ki += 1
+                    tail_part = "".join(ln_current).strip()
+                    if tail_part:
+                        result_parts.append(tail_part)
+                    return result_parts
+
+                items: list[str] = []
+                for joined_line in joined:
+                    items.extend(_parse_skills_line(joined_line))
+                return [it for it in items if it.strip()]
+
+            # ── SUMMARY: join wrapped prose lines ─────────────────────────────
+            captured: list[str] = []
+            for raw in raw_lines:
+                stripped = raw.strip()
+                clean = re.sub(r"^[\u2022\u2023\u25E6\-\*]\s*", "", stripped).strip()
+                clean = re.sub(r"^•\s*", "", clean).strip()
+                if not clean:
+                    continue
+                is_bullet_start = bool(re.match(r"^[•\-\*]", stripped))
+                if is_summary_section and captured and not is_bullet_start:
+                    captured[-1] = captured[-1].rstrip() + " " + clean
+                else:
+                    captured.append(clean)
             return [line for line in captured if line.strip()]
 
         original_skills_summary_bullets = extract_plain_section_bullets("SKILLS SUMMARY", resume_text)
+        original_summary_bullets = extract_plain_section_bullets("SUMMARY", resume_text)
+
+        def extract_original_bullets_from_resume(text: str) -> dict[str, list[str]]:
+            """Extract all bullets from EXPERIENCE and PROJECTS, joining pypdf-wrapped lines.
+            Returns { "EXPERIENCE": [bullet1, bullet2, ...], "PROJECTS": [...] }
+            """
+            BULLET_RE     = re.compile(r"^[•‣◦●●▸●•\-\*]\s+")
+            SECTION_HEADER = re.compile(r"^[A-Z][A-Z0-9 &/\-]{3,}$")
+            # Lines that look like an experience entry heading (job title + date glued on by pypdf)
+            ENTRY_HEADING_RE = re.compile(r".{4,}\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4}")
+            TARGET_SECTIONS = {"EXPERIENCE", "PROJECTS", "VOLUNTEER", "VOLUNTEER EXPERIENCE"}
+
+            result: dict[str, list[str]] = {}
+            lines = [l.rstrip() for l in text.splitlines()]
+            current_section: str | None = None
+            current_bullet: list[str] = []
+            pool: list[str] = []
+
+            # Heading-like patterns pypdf glues onto the end of the last bullet
+            HEADING_SUFFIX = re.compile(
+                r"\.\s+("
+                r"[A-Z][a-zA-Z ]+ \| "          # "Blog Platform | ..."
+                r"|University of [A-Z]"           # "University of Windsor..."
+                r"|Wayne State"
+                r"|[A-Z]{2,}[a-z]* [A-Z][a-z]+"  # "Teaching Assistant", "Research Assistant"
+                r")",
+                re.IGNORECASE,
+            )
+
+            def flush_bullet():
+                if current_bullet:
+                    full = " ".join(current_bullet).strip()
+                    # Truncate at any point where a heading got glued on by pypdf
+                    m = HEADING_SUFFIX.search(full)
+                    if m:
+                        full = full[:m.start() + 1].strip()  # keep the period, drop the rest
+                    if full:
+                        pool.append(full)
+                    current_bullet.clear()
+
+            for line in lines:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                if SECTION_HEADER.match(stripped):
+                    header = stripped.upper()
+                    if header in TARGET_SECTIONS:
+                        flush_bullet()
+                        if current_section and pool:
+                            result[current_section] = list(pool)
+                            pool.clear()
+                        current_section = header
+                    elif current_section:
+                        flush_bullet()
+                        if pool:
+                            result[current_section] = list(pool)
+                            pool.clear()
+                        current_section = None
+                    continue
+                if current_section is None:
+                    continue
+                if BULLET_RE.match(stripped):
+                    flush_bullet()
+                    current_bullet.append(BULLET_RE.sub("", stripped).strip())
+                elif current_bullet and ENTRY_HEADING_RE.match(stripped):
+                    # pypdf glued a "Job Title Month YYYY" line onto the last bullet — flush now, don't append
+                    flush_bullet()
+                else:
+                    if current_bullet:
+                        current_bullet.append(stripped)
+
+            flush_bullet()
+            if current_section and pool:
+                result[current_section] = list(pool)
+            return result
+
+        original_section_bullets = extract_original_bullets_from_resume(resume_text)
 
         import asyncio
 
+        class RateLimitError(Exception):
+            def __init__(self, retry_after: int):
+                self.retry_after = retry_after
+                super().__init__(f"Rate limit hit — retry in {retry_after}s")
+
         async def call_gemini(prompt: str, temperature: float = 0.1, max_tokens: int = 1024) -> str:
-            """Call Gemini API with retry logic. Returns response text."""
-            for attempt in range(4):
+            """Call Gemini API. Fails immediately on 429 — retries up to 3x on transient 5xx errors."""
+            for attempt in range(3):
                 attempt_start = perf_counter()
-                print(f"[call_gemini] attempt={attempt+1}/4 temperature={temperature} max_tokens={max_tokens} starting")
+                print(f"[call_gemini] attempt={attempt+1}/2 temperature={temperature} max_tokens={max_tokens} starting")
                 try:
                     async with httpx.AsyncClient(timeout=120) as client:
                         resp = await client.post(
@@ -468,8 +802,6 @@ async def tailor_resume(payload: dict):
                             raise ValueError("No candidates in response")
                         parts = candidates[0].get("content", {}).get("parts", [])
                         elapsed = perf_counter() - attempt_start
-                        
-                        
                         print(f"[call_gemini] attempt={attempt+1} succeeded elapsed={elapsed:.1f}s status={resp.status_code} candidates={len(candidates)}")
                         quota_increment()
                         return "".join(p.get("text", "") for p in parts).strip()
@@ -479,25 +811,33 @@ async def tailor_resume(payload: dict):
                     raise Exception("Could not reach Gemini API.")
                 except httpx.HTTPStatusError as e:
                     elapsed = perf_counter() - attempt_start
-                    retry_after = e.response.headers.get("retry-after")
-                    print(f"[call_gemini] attempt={attempt+1} http error elapsed={elapsed:.1f}s status={e.response.status_code} retry_after={retry_after}")
+                    retry_after_hdr = e.response.headers.get("retry-after")
+                    print(f"[call_gemini] attempt={attempt+1} http error elapsed={elapsed:.1f}s status={e.response.status_code} retry_after={retry_after_hdr}")
                     if e.response.status_code == 403:
                         raise Exception("Invalid GEMINI_API_KEY.")
                     if e.response.status_code == 429:
-                        wait_time = int(retry_after) if retry_after else 15 * (attempt + 1)
-                        print(f"[call_gemini] rate limited — waiting {wait_time}s before retry")
-                        await asyncio.sleep(wait_time)
+                        retry_after = int(retry_after_hdr) if retry_after_hdr else 60
+                        print(f"[call_gemini] rate limited — failing immediately, retry in {retry_after}s")
+                        raise RateLimitError(retry_after)
+                    if e.response.status_code in (500, 502, 503, 504):
+                        wait = 3 * (attempt + 1)  # 3s, 6s, 9s
+                        print(f"[call_gemini] transient {e.response.status_code} — waiting {wait}s before retry")
+                        if attempt == 2:
+                            raise Exception("Gemini service unavailable. Please try again in a moment.")
+                        await asyncio.sleep(wait)
                         continue
                     raise Exception(f"Gemini API error {e.response.status_code}")
+                except RateLimitError:
+                    raise
                 except Exception as e:
                     elapsed = perf_counter() - attempt_start
                     print(f"[call_gemini] attempt={attempt+1} failed elapsed={elapsed:.1f}s error={e}")
                     if "Could not reach" in str(e) or "Invalid GEMINI" in str(e):
                         raise
-                    if attempt == 3:
+                    if attempt == 2:
                         raise Exception(f"AI call failed: {str(e)}")
-                    await asyncio.sleep(2 ** attempt)  # brief backoff for other transient errors
-            raise Exception("Rate limit persisted after 4 attempts.")
+                    await asyncio.sleep(2)
+            raise Exception("Request failed after 3 attempts.")
 
         print("[tailor_resume] stage=start single_pass_rewrite")
 
@@ -517,10 +857,10 @@ async def tailor_resume(payload: dict):
 
 PART A — KEYWORD ANALYSIS (from the job description):
 Identify internally and include in the output JSON:
-  - tier1_hard_skills: specific named hard skills EXPLICITLY mentioned in the job description. Extract ONLY what appears in the text — do NOT infer, assume, or add skills not present. For retail/service roles extract things like POS systems, inventory software, or named tools mentioned. For tech roles extract languages, frameworks, platforms. For business roles extract named software or certifications. Maximum 12 items.
-  - tier2_professional_concepts: concise workplace skill phrases (2-5 words) that match the domain of this specific role. For retail: customer engagement, inventory control, order fulfillment. For tech: system design, code review, CI/CD pipelines. Extract only what the job description actually emphasizes. Maximum 8 items.
-  - exclude_from_bullets: skills or tools that would be factually inaccurate for this candidate based on the resume.
-CRITICAL: Base ALL extraction purely on what the job description explicitly says. The role domain determines what keywords are relevant — a retail job should return retail keywords, a tech job should return tech keywords. Never mix domains.
+  - tier1_hard_skills: specific named TECHNICAL hard skills EXPLICITLY mentioned in the job description (languages, frameworks, tools, platforms, named software). Extract ONLY what appears in the text. Maximum 12 items. Technical only — no soft skills here.
+  - tier2_professional_concepts: concise NON-TECHNICAL workplace skill phrases (2-5 words) matching this role's domain — e.g. task estimation, code review, clear communication, defined requirements, on-time delivery. Extract only what the job description actually emphasizes. Maximum 8 items. Soft/process only — never put tool names here.
+  - exclude_from_bullets: skills or tools that would be factually inaccurate for this candidate based on the resume (e.g. if JD requires PHP but candidate has never used it, exclude PHP from bullet injection).
+CRITICAL: Base ALL extraction purely on what the job description explicitly says. The role domain determines what keywords are relevant. Never mix domains.
 Use these keywords when rewriting bullets in Part B.
 
 PART B — RESUME REWRITE:
@@ -529,7 +869,9 @@ Rewrite the resume below to pass ATS screening for the given job description usi
 RULES — follow every one exactly:
 
 RULE 1 — PRESERVE ALL CONTENT:
-Keep every section, every entry, and every bullet. Never drop, merge, omit, or reorder anything.
+Keep every section, every entry, and every bullet. Never drop, merge, omit, shorten, or reorder anything.
+CRITICAL: Every bullet must be at LEAST as long as the original. If the original bullet is "Coordinated with a team of guards to maintain safety protocols and respond to incidents promptly", the output must contain the full sentence — never "Coordinated with a team of guards" alone. Truncating the end of a bullet is a critical failure.
+When in doubt: copy the bullet verbatim, then add the keyword injection. Never remove words that were already there.
 
 RULE 2 — PRESERVE ALL NUMBERS EXACTLY:
 Copy all numbers, percentages, dataset sizes, and counts character-for-character.
@@ -539,22 +881,31 @@ RULE 3 — KEYWORD INJECTION — HOW TO DO IT RIGHT:
 Your goal is to weave keywords into bullets by replacing vague words with more specific ones from the keyword list, or by restructuring the sentence so the keyword is part of the core action — not tacked on at the end.
 
 TIERED INJECTION RULES:
-- Tier 1 keywords (hard technical skills): Only inject these if they already appear somewhere in the original resume. If a Tier 1 keyword does not appear in the original resume, do not inject it anywhere.
-- Tier 2 keywords (professional concepts): Always consider these for injection wherever they fit naturally, regardless of whether they appear in the original resume.
+- Tier 1 keywords (hard technical skills / named tools): Only inject these if they already appear somewhere in the original resume. If a Tier 1 keyword does not appear in the original resume, do not inject it anywhere.
+- Tier 2 keywords (professional concepts / soft skills): Always inject these wherever they fit naturally. For non-technical resumes (customer service, admin, warehouse, hospitality), Tier 2 is your PRIMARY injection target — these are exactly the keywords ATS systems scan for in soft-skill roles.
+- CRITICAL — NO PRECISION DOWNGRADE: If a bullet already contains a specific, accurate term, NEVER replace it with a vaguer one.
 
-CONCRETE EXAMPLES using this candidate's actual bullets:
+RESUME TYPE DETECTION:
+If the resume contains a "SKILLS SUMMARY" section with plain bullet soft skills (rather than a "TECHNICAL SKILLS" section with Category: tool lists), treat it as a NON-TECHNICAL RESUME. For non-technical resumes:
+  - Tier 2 injection into experience bullets is the main goal
+  - Replace vague action verbs or generic descriptions with the exact phrasing from the JD
+  - Weave in concepts like "data accuracy", "data integrity", "confidentiality", "reporting", "attention to detail" naturally into bullets that already demonstrate those things
+
+CONCRETE EXAMPLES — TECHNICAL resume:
 
   ORIGINAL:  "Implemented a RAG pipeline with TF-IDF chunk retrieval, reducing context window usage"
   REWRITTEN: "Implemented an NLP retrieval pipeline using RAG with TF-IDF chunk scoring, reducing context window usage and improving response relevance"
   WHY VALID: "NLP retrieval pipeline" replaces "RAG pipeline" — the keyword enriches the description of what was built.
 
-  ORIGINAL:  "Evaluated multiple CNN and Graph-CNN models for pixel classification, documented results, and recommended the best model based on accuracy and runtime performance."
-  REWRITTEN: "Evaluated CNN and Graph-CNN architectures for pixel classification, benchmarking accuracy and runtime to recommend the highest-performing model for research publication."
-  WHY VALID: "research publication" replaced "best model" — it's a genuine enrichment of what "recommended" led to.
+CONCRETE EXAMPLES — NON-TECHNICAL resume:
 
-  ORIGINAL:  "Built cross-document synthesis engine with web search integration (DuckDuckGo), APA citation generation, and structured research report generation via LLM."
-  REWRITTEN: "Built a cross-document NLP synthesis engine with web search integration (DuckDuckGo), APA citation generation, and structured research report generation via LLM."
-  WHY VALID: "NLP synthesis engine" replaces "synthesis engine" — one word swap, no appending.
+  ORIGINAL:  "Managed and organized large datasets and documentation as part of a university research project"
+  REWRITTEN: "Maintained data accuracy and completeness across large datasets and documentation as part of a university research project"
+  WHY VALID: "data accuracy and completeness" replaces "organized" — directly matches JD language for a data entry role.
+
+  ORIGINAL:  "Collaborated with a team to test and evaluate multiple solutions, tracking results and recommending the best approach"
+  REWRITTEN: "Collaborated with a team to evaluate multiple solutions, tracking results and identifying data discrepancies to recommend the best approach"
+  WHY VALID: "identifying data discrepancies" slots naturally into the existing structure and matches JD requirement.
 
 WHAT IS FORBIDDEN — appending phrases to already-complete sentences:
   ORIGINAL:  "Optimized throughput by ~75% using ThreadPoolExecutor, with real-time SSE streaming."
@@ -584,10 +935,9 @@ RULE 5A — PLAIN BULLET SECTIONS:
   - If a section is titled "SKILLS SUMMARY" or contains plain bullet points without a "Category:" prefix, preserve all bullets verbatim in the output unchanged. Do not summarize, omit, or rewrite any of those bullets.
 
 RULE 5B — SUMMARY SECTION:
-  - If the original resume has a SUMMARY section, rewrite it to naturally incorporate 2-3 relevant Tier 2 professional concepts from the job description, while preserving the candidate's actual background, tone, and length.
-  - Do not shorten it. Do not bullet-point it. Keep it as a single prose paragraph matching the original length.
+  - Copy the SUMMARY section VERBATIM from the original resume. Every word, every sentence, character-for-character.
+  - Do NOT change anything. No keyword injection, no rephrasing, no reordering.
   - If there is no SUMMARY section in the original resume, do not create one.
-
 RULE 6 — NO MARKDOWN:
 No bold, no italic, no backticks, no bullet symbols. Plain text only in every field.
 
@@ -732,16 +1082,78 @@ JSON:"""
         original_skill_lines: dict[str, str] = {}
         original_skill_order: list[str] = []
 
+        NON_SKILL_PREFIXES = {
+            "email", "phone", "tel", "address", "linkedin", "github",
+            "portfolio", "website", "url", "name", "gpa", "university",
+            "college", "school", "location", "city",
+        }
+
+        _last_skill_cat: str | None = None
         for line in resume_text.splitlines():
-            m = re.match(r"^([A-Za-z0-9 &/+-]+):\s*(.+)$", line.strip())
+            stripped = line.strip()
+            if not stripped:
+                _last_skill_cat = None
+                continue
+            m = re.match(r"^([A-Za-z0-9 &/+-]+):\s*(.+)$", stripped)
             if m:
                 cat_key = m.group(1).strip().lower()
+                if cat_key in NON_SKILL_PREFIXES:
+                    _last_skill_cat = None
+                    continue
                 if cat_key not in original_skill_lines:
                     original_skill_lines[cat_key] = m.group(2).strip()
                     original_skill_order.append(m.group(1).strip())
+                    _last_skill_cat = cat_key
+                else:
+                    _last_skill_cat = None
+            elif _last_skill_cat and re.match(r"^[A-Za-z0-9]", stripped):
+                # Continuation line — pypdf wrapped a long skill list onto the next line.
+                # Only join if it still looks like a comma-separated skill list fragment.
+                # Reject if it looks like an institution, date range, job title, or section header.
+                _is_section_header   = bool(re.match(r"^[A-Z][A-Z0-9 &/\-]{3,}$", stripped))
+                _has_pipe            = "|" in stripped
+                _has_year            = bool(re.search(r"\b(19|20)\d{2}\b", stripped))
+                _has_month_range     = bool(re.search(r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b", stripped))
+                _looks_like_sentence = len(stripped.split()) > 6 and "," not in stripped
+                # Must look like a skill fragment: has a comma (multiple items) OR is a
+                # short tech token (digits/dots/symbols allowed, <=3 plain words).
+                # Blocks plain English phrases like "Research Assistant" or "Teaching Assistant".
+                _has_comma      = "," in stripped
+                _has_tech_char  = bool(re.search(r"[0-9.#+/()\-]", stripped))
+                _is_single_word = len(stripped.split()) == 1
+                _is_skill_token = bool(re.match(r"^[A-Za-z0-9.][A-Za-z0-9 .#+/()\-]*$", stripped)) and (_is_single_word or _has_tech_char)
+                _looks_like_skill = _has_comma or _is_skill_token
+                if _looks_like_skill and not any([_is_section_header, _has_pipe, _has_year, _has_month_range, _looks_like_sentence]):
+                    original_skill_lines[_last_skill_cat] = original_skill_lines[_last_skill_cat].rstrip(", ") + ", " + stripped.rstrip(",")
+            else:
+                _last_skill_cat = None
 
         def split_skill_items(skill_line: str) -> list[str]:
-            return [item.strip() for item in skill_line.split(",") if item.strip()]
+            """Split a comma-separated skill line into items.
+            Treats parenthetical groups as atomic — commas inside (...) are not split points.
+            e.g. "Git, AWS (Elastic Beanstalk, RDS, S3), Docker" → ["Git", "AWS (Elastic Beanstalk, RDS, S3)", "Docker"]
+            """
+            items = []
+            current = []
+            depth = 0
+            for ch in skill_line:
+                if ch == "(":
+                    depth += 1
+                    current.append(ch)
+                elif ch == ")":
+                    depth -= 1
+                    current.append(ch)
+                elif ch == "," and depth == 0:
+                    token = "".join(current).strip()
+                    if token:
+                        items.append(token)
+                    current = []
+                else:
+                    current.append(ch)
+            token = "".join(current).strip()
+            if token:
+                items.append(token)
+            return items
 
         def reorder_existing_items(items: list[str], keywords: list[str]) -> list[str]:
             matched = []
@@ -797,27 +1209,72 @@ JSON:"""
             if not _is_injectable_skill(skill):
                 return None
             skill_lower = skill.lower().strip()
+
+            # Block soft/process concepts — they have no place in a technical skills section
+            non_tech_signals = [
+                "communication", "ownership", "delivery", "estimation", "review",
+                "collaboration", "planning", "management", "agile", "scrum",
+                "workflow", "feedback", "mentorship", "leadership",
+            ]
+            if any(sig in skill_lower for sig in non_tech_signals):
+                return None
+
+            # Explicit skill-type taxonomy to prevent misrouting.
+            # e.g. Laravel must never land in Languages; Vue must never land in Frameworks.
+            LANGUAGES = {
+                "php", "python", "java", "javascript", "typescript", "c", "c#", "c++",
+                "ruby", "go", "rust", "swift", "kotlin", "scala", "r", "sql", "bash",
+                "shell", "perl", "dart", "elixir", "haskell", "lua",
+            }
+            FRAMEWORKS = {
+                "laravel", "symfony", "codeigniter", "django", "flask", "fastapi",
+                "rails", "spring", "spring boot", "express", "nest.js", "nestjs",
+                "asp.net", "next.js", "nuxt", "nuxt.js", "gatsby",
+            }
+            FRONTEND_FW = {
+                "vue", "vue.js", "react", "angular", "svelte", "alpine.js",
+                "htmx", "jquery", "backbone.js",
+            }
+            DATABASES = {
+                "mysql", "postgresql", "postgres", "sqlite", "mongodb", "redis",
+                "snowflake", "mariadb", "oracle", "mssql", "dynamodb", "cassandra",
+                "firebase", "supabase",
+            }
+
             for cat_display in original_skill_order:
                 cat_key = cat_display.lower()
-                # Languages: only simple single-token identifiers (Python, Java, SQL, C++)
+
                 if cat_key == "languages":
-                    if re.match(r"^[a-z][a-z0-9+#/]*$", skill_lower):
-                        return cat_display
-                    continue  # don't fall through to other categories
-                if any(k in cat_key for k in ["framework", "library", "libraries"]):
-                    # Only proper named libraries/frameworks
-                    known_fw = {
-                        "hadoop", "spark", "mlflow", "flask", "react", "next.js",
-                        "node.js", "vue", "angular", "fastapi", "django",
-                    }
-                    if skill_lower in known_fw or re.match(r"^[a-z][a-z0-9.]+$", skill_lower):
+                    # Pure programming/query languages only — never frameworks
+                    if skill_lower in LANGUAGES and skill_lower not in FRAMEWORKS and skill_lower not in FRONTEND_FW:
                         return cat_display
                     continue
+
+                if any(k in cat_key for k in ["framework", "library", "libraries"]):
+                    if skill_lower in FRAMEWORKS:
+                        return cat_display
+                    continue
+
+                if any(k in cat_key for k in ["frontend", "front-end", "front end"]):
+                    if skill_lower in FRONTEND_FW:
+                        return cat_display
+                    continue
+
+                if any(k in cat_key for k in ["database", "db"]):
+                    if skill_lower in DATABASES:
+                        return cat_display
+                    continue
+
+                if any(k in cat_key for k in ["tool", "devops", "platform", "service"]):
+                    # Catch-all for tooling — only if not already categorized above
+                    if skill_lower not in LANGUAGES and skill_lower not in FRAMEWORKS and skill_lower not in FRONTEND_FW and skill_lower not in DATABASES:
+                        return cat_display
+                    continue
+
                 if any(k in cat_key for k in ["data", "ai", "ml", "analytics", "machine learning"]):
                     return cat_display
-                if any(k in cat_key for k in ["tool", "devops", "database", "db", "platform", "service"]):
-                    return cat_display
-            # No fallback — if nothing fits cleanly, don't inject
+
+            # No suitable category found — don't inject
             return None
 
         skill_keywords = [kw.lower() for kw in tier1_keywords if kw.strip()]
@@ -830,6 +1287,8 @@ JSON:"""
             skill_items_per_cat[cat_display] = reorder_existing_items(items, skill_keywords)
 
         resume_lower = resume_text.lower()
+        # Inject Tier 1 skills — ONLY if the skill already appears in the original resume body.
+        # Never fabricate or infer. If it's not there, it does not get added.
         for skill in tier1_keywords:
             if not skill.strip():
                 continue
@@ -841,11 +1300,11 @@ JSON:"""
             )
             if already_present:
                 continue
-            # Only inject tier1 skills if they appear in the original resume
             if re.search(rf"(?<!\w){re.escape(skill_lower)}(?!\w)", resume_lower):
                 target_cat = choose_skill_category(skill)
                 if target_cat and skill not in skill_items_per_cat.get(target_cat, []):
                     skill_items_per_cat[target_cat].append(skill)
+                    print(f"[skills] Injected '{skill}' into '{target_cat}' (found in resume body)")
 
         final_skill_lines: list[str] = [
             f"{cat_display}: {', '.join(skill_items_per_cat[cat_display])}"
@@ -856,90 +1315,150 @@ JSON:"""
             title_upper = section.get("title", "").upper()
             if "SKILL" in title_upper:
                 if "SKILLS SUMMARY" in title_upper or "SKILL SUMMARY" in title_upper:
-                    # Always restore from original — AI mangles plain-bullet skill sections
-                    if original_skills_summary_bullets:
-                        section["entries"] = [{"heading": "", "subheading": "", "bullets": original_skills_summary_bullets}]
-                    else:
-                        # Fallback: use whatever AI returned if we have nothing original
-                        current_bullets = [b for entry in section.get("entries", []) for b in normalize_list_of_strings(entry.get("bullets"))]
-                        if not current_bullets:
-                            section["entries"] = [{"heading": "", "subheading": "", "bullets": []}]
+                    # Start from original bullets — AI must not modify plain-bullet skill sections
+                    base_bullets = list(original_skills_summary_bullets) if original_skills_summary_bullets else [
+                        b for entry in section.get("entries", [])
+                        for b in normalize_list_of_strings(entry.get("bullets"))
+                    ]
+                    # Inject tier 2 soft skills from the JD that aren't already present.
+                    # Only add if genuinely absent — case-insensitive check.
+                    base_lower = [b.lower() for b in base_bullets]
+                    injected_count = 0
+                    MAX_SOFT_INJECTIONS = 5
+                    for kw in tier2_keywords:
+                        if injected_count >= MAX_SOFT_INJECTIONS:
+                            break
+                        kw_lower = kw.lower().strip()
+                        if not kw_lower:
+                            continue
+                        # Dedup check 1: exact or substring match
+                        already_exact = any(kw_lower in b for b in base_lower)
+                        # Dedup check 2: significant word overlap — if 2+ meaningful words
+                        # of the new keyword already appear in any existing skill, skip it.
+                        # e.g. "communication skills" overlaps "customer service & communication"
+                        # Strong domain words — if any of these appear in both the
+                        # new keyword AND an existing skill, treat as duplicate.
+                        STRONG_SKILL_WORDS = {
+                            "communication", "teamwork", "customer", "service",
+                            "inventory", "data", "problem", "solving",
+                            "time", "detail", "leadership", "organization", "entry",
+                            "reliability", "collaboration", "initiative", "typing",
+                        }
+                        kw_words = {w for w in kw_lower.split() if len(w) > 3}
+                        kw_strong = kw_words & STRONG_SKILL_WORDS
+                        already_overlap = any(
+                            # Block if: 2+ word overlap, OR any single strong-domain word matches
+                            len(kw_words & {w for w in b.split() if len(w) > 3}) >= min(2, len(kw_words))
+                            or bool(kw_strong & {w for w in b.split()})
+                            for b in base_lower
+                        ) if kw_words else False
+                        if not already_exact and not already_overlap:
+                            kw_titled = kw.title()
+                            base_bullets.append(kw_titled)
+                            base_lower.append(kw_lower)
+                            injected_count += 1
+                            print(f"[skills summary] Injected tier2 soft skill: '{kw_titled}'")
+                        else:
+                            print(f"[skills summary] Skipped duplicate: '{kw}' (overlaps existing)")
+                    section["entries"] = [{"heading": "", "subheading": "", "bullets": base_bullets}]
                     continue
                 # Regular categorized skills section
                 section["entries"] = [{"heading": "", "subheading": "", "bullets": final_skill_lines}]
                 break
+
+        # ── Summary rewrite — focused, honest refocusing ────────────────────────
+        # Rewrites the summary to lead with what this specific JD cares about,
+        # without fabricating any new claims. Falls back to original if anything goes wrong.
+
+        # Detect resume type here too — needed for summary rewrite framing.
+        # (Also computed again in scoring block below — that's intentional, keep both.)
+        is_non_tech_resume = bool(original_skills_summary_bullets)
+
+        original_summary_text = " ".join(original_summary_bullets).strip() if original_summary_bullets else ""
+        tailored_summary_text = original_summary_text  # default: keep original
+
+        if original_summary_text and job_text.strip():
+            try:
+                resume_type_hint = (
+                    "This is a NON-TECHNICAL resume (customer service / admin / general labour). "
+                    "The summary should lead with the most relevant soft skills and availability for this role."
+                    if is_non_tech_resume else
+                    "This is a TECHNICAL resume (software engineering / development). "
+                    "The summary should lead with the most relevant technical specialisation for this role."
+                )
+                summary_prompt = f"""You are rewriting a resume summary to better match a specific job description.
+
+RESUME TYPE: {resume_type_hint}
+
+ORIGINAL SUMMARY:
+{original_summary_text}
+
+JOB DESCRIPTION (first 1500 chars):
+{job_text[:1500]}
+
+RULES — follow every one exactly:
+1. Keep the same length (± 10 words). Do not make it longer.
+2. Do not add any claim, skill, technology, or experience not already present in the original summary.
+3. Only reorder, refocus, or rephrase existing content to lead with what the JD emphasises.
+4. Keep the same person and tense (first/third person, present/past).
+5. For technical resumes: if the JD emphasises a specific stack or domain (e.g. backend, ML, cloud), lead with that angle from what's already in the summary.
+6. For non-technical resumes: lead with the most relevant soft skill or availability statement for this role.
+7. If the original summary already matches the JD well, return it unchanged.
+8. Return ONLY the rewritten summary text — no labels, no JSON, no explanation.
+
+REWRITTEN SUMMARY:"""
+
+                candidate = await call_gemini(summary_prompt, temperature=0.2, max_tokens=300)
+                candidate = candidate.strip()
+                # Validate: must be non-empty, not too different in length, no JSON artifacts
+                if (candidate and
+                    len(candidate) > 30 and
+                    len(candidate) < len(original_summary_text) * 2.5 and
+                    "{" not in candidate and
+                    "REWRITTEN" not in candidate.upper()):
+                    tailored_summary_text = candidate
+                    print(f"[summary] Rewritten ({len(original_summary_text)} → {len(tailored_summary_text)} chars)")
+                else:
+                    print(f"[summary] Rewrite rejected, keeping original")
+            except Exception as e:
+                print(f"[summary] Rewrite failed ({e}), keeping original")
+
+        for section in resume_data.get("sections", []):
+            title_upper = section.get("title", "").upper()
+            if title_upper == "SUMMARY" and original_summary_text:
+                section["entries"] = [{"heading": "", "subheading": "", "bullets": [tailored_summary_text]}]
 
         # Post-process 3: Drop empty bullets
         for section in resume_data.get("sections", []):
             for entry in section.get("entries", []):
                 entry["bullets"] = normalize_list_of_strings(entry.get("bullets"))
 
-        # Post-process 4: Dynamic Tier 2 keyword injection
-        # Strategy: for each tier2 keyword, find the bullet where it fits best
-        # by looking for semantically related words already in the bullet.
-        # Works for any domain — tech, retail, business, etc.
-
-        used_tier2 = set()
-
-        def _semantic_match_score(kw: str, bullet: str) -> float:
-            """Score how well a tier2 keyword fits a bullet based on shared words."""
-            kw_words = set(re.findall(r"[a-z]+", kw.lower())) - {
-                "and", "or", "the", "a", "an", "in", "of", "to", "for", "with", "on", "at"
-            }
-            bullet_words = set(re.findall(r"[a-z]+", bullet.lower()))
-            if not kw_words:
-                return 0.0
-            overlap = kw_words & bullet_words
-            return len(overlap) / len(kw_words)
-
-        def _inject_tier2_into_bullet(bullet: str, kw: str) -> str:
-            """
-            Try to inject kw naturally into bullet by replacing a vague ending phrase.
-            If no good injection point found, return bullet unchanged.
-            """
-            # Patterns: replace weak ending phrases like "the best approach", "good results"
-            # with the tier2 keyword phrase
-            weak_endings = [
-                r"(,?\s+(?:achieving|ensuring|enabling|providing|delivering|supporting|improving|maintaining)\s+[\w\s]{3,25})$",
-                r"(,?\s+(?:effectively|efficiently|successfully|consistently)\s+[\w\s]{3,20})$",
-                r"(,?\s+(?:good|strong|effective|positive|successful)\s+[\w\s]{3,20})$",
-            ]
-            for pattern in weak_endings:
-                m = re.search(pattern, bullet, re.IGNORECASE)
-                if m:
-                    replacement = f", demonstrating {kw}"
-                    candidate = bullet[:m.start()] + replacement
-                    # Only use if shorter than original + 20 chars
-                    if len(candidate) <= len(bullet) + 20:
-                        return candidate
-            return bullet  # no injection if no good fit
-
+        # Post-process 4: Restore original bullets for EXPERIENCE and PROJECTS
+        # Gemini keeps heading/subheading/structure; bullet text always comes from original PDF.
+        # Uses a flat pool matched by count per entry — immune to truncation and stuffing.
         for section in resume_data.get("sections", []):
             title_upper = section.get("title", "").upper()
-            if "SKILL" in title_upper or "SUMMARY" in title_upper:
+            orig_key = None
+            if "VOLUNTEER" in title_upper:
+                orig_key = "VOLUNTEER"
+            elif "VOLUNTEER EXPERIENCE" in title_upper:
+                orig_key = "VOLUNTEER EXPERIENCE"
+            elif "EXPERIENCE" in title_upper:
+                orig_key = "EXPERIENCE"
+            elif "PROJECT" in title_upper:
+                orig_key = "PROJECTS"
+            if not orig_key or orig_key not in original_section_bullets:
                 continue
+            orig_pool = original_section_bullets[orig_key]
+            pool_idx  = 0
             for entry in section.get("entries", []):
-                new_bullets = []
-                for b in normalize_list_of_strings(entry.get("bullets")):
-                    if len(used_tier2) < 4:  # cap at 4 injections per resume
-                        for kw in tier2_keywords:
-                            if kw in used_tier2:
-                                continue
-                            if kw.lower() in b.lower():
-                                # Already present — count it
-                                used_tier2.add(kw)
-                                continue
-                            score = _semantic_match_score(kw, b)
-                            if score >= 0.4:  # at least 40% word overlap
-                                b_new = _inject_tier2_into_bullet(b, kw)
-                                if b_new != b:
-                                    b = b_new
-                                    used_tier2.add(kw)
-                                    break
-                    new_bullets.append(b)
-                entry["bullets"] = new_bullets
+                ai_count = len(normalize_list_of_strings(entry.get("bullets")))
+                if ai_count == 0 or pool_idx >= len(orig_pool):
+                    continue
+                entry["bullets"] = orig_pool[pool_idx: pool_idx + ai_count]
+                pool_idx += ai_count
 
-        # extract_job_keywords removed — keywords come directly from main Gemini prompt (tier1_hard_skills / tier2_professional_concepts fields)
+
 
         def extract_keyword_fallback_scan(text: str) -> tuple[list[str], list[str]]:
             lower_text = text.lower()
@@ -1104,22 +1623,124 @@ JSON:"""
             escaped = escaped.replace(r"\ ", r"\s+")
             return re.search(rf"(?<!\w){escaped}(?!\w)", text, flags=re.IGNORECASE) is not None
 
-        all_keywords        = tier1_keywords + tier2_keywords
-        original_resume_keywords = [kw for kw in all_keywords if keyword_present(kw, normalized_original_text)]
-        matched_keywords = [kw for kw in all_keywords if keyword_present(kw, normalized_resume_text)]
-        injected_keyword_list = [kw for kw in matched_keywords if kw not in original_resume_keywords]
-        missing_keywords = [kw for kw in all_keywords if not keyword_present(kw, normalized_resume_text)]
-        
-        # For scoring: only count tier1 keywords that appear in original resume + all tier2 keywords
-        tier1_in_original = [kw for kw in tier1_keywords if keyword_present(kw, normalized_original_text)]
-        scoring_keywords = tier1_in_original + tier2_keywords  # Only these count toward coverage score
-        matched_scoring_keywords = [kw for kw in scoring_keywords if keyword_present(kw, normalized_resume_text)]
-        
-        keyword_match_count = len(matched_scoring_keywords)
-        keyword_total_count = len(scoring_keywords)
+        # ── Synonym/alias map: if a JD keyword matches any alias, treat it as present
+        SKILL_SYNONYMS = [
+            # REST / API variations
+            {"rest api", "rest apis", "restful api", "restful apis", "restful", "rest"},
+            # SQL variants
+            {"sql", "sql server", "microsoft sql server", "t-sql", "tsql", "mssql"},
+            # Cloud / AWS
+            {"aws", "amazon web services", "amazon aws"},
+            {"elastic beanstalk", "aws elastic beanstalk"},
+            {"ec2", "aws ec2", "amazon ec2"},
+            {"s3", "aws s3", "amazon s3"},
+            {"lambda", "aws lambda"},
+            # Azure
+            {"azure", "microsoft azure", "ms azure"},
+            # GCP
+            {"gcp", "google cloud", "google cloud platform"},
+            # Kubernetes / container
+            {"kubernetes", "k8s"},
+            {"docker", "docker container", "docker containers"},
+            # CI/CD
+            {"ci/cd", "ci cd", "continuous integration", "continuous deployment", "continuous delivery"},
+            # JavaScript variants
+            {"javascript", "js"},
+            {"typescript", "ts"},
+            {"node.js", "nodejs", "node js"},
+            # React
+            {"react", "react.js", "reactjs"},
+            # Python
+            {"python", "python3", "python 3"},
+            # C++ / C
+            {"c++", "cpp", "c plus plus"},
+            # Machine learning
+            {"machine learning", "ml"},
+            {"artificial intelligence", "ai"},
+            {"natural language processing", "nlp"},
+            # Data / analytics
+            {"power bi", "powerbi"},
+            {"tableau", "tableau software"},
+            # Version control
+            {"git", "github", "gitlab", "git/github"},
+            # Linux / Unix
+            {"linux", "unix", "unix/linux", "linux/unix"},
+            # Agile
+            {"agile", "agile methodology", "agile methodologies", "scrum", "agile/scrum"},
+            # OOP
+            {"oop", "object oriented programming", "object-oriented programming", "object oriented", "object-oriented"},
+            # Spring
+            {"spring", "spring boot", "spring framework"},
+            # Microservices
+            {"microservices", "microservice", "microservice architecture", "microservices architecture"},
+            # Shell
+            {"shell", "shell script", "shell scripting", "bash", "bash scripting"},
+            # JWT
+            {"jwt", "jwt authentication", "json web token", "json web tokens"},
+            # PostgreSQL
+            {"postgresql", "postgres"},
+            # MongoDB
+            {"mongodb", "mongo"},
+            # Java build tools
+            {"maven", "apache maven"},
+            {"gradle", "apache gradle"},
+            # .NET
+            {".net", "dotnet", "asp.net", "asp.net core"},
+            # Testing
+            {"junit", "junit5", "junit 5"},
+            # Redis
+            {"redis", "redis cache"},
+        ]
+
+        def _get_synonym_group(keyword: str):
+            kw = keyword.strip().lower()
+            for group in SKILL_SYNONYMS:
+                if kw in group:
+                    return group
+            return {kw}
+
+        def keyword_present_with_synonyms(keyword: str, text: str) -> bool:
+            """Check if keyword OR any of its synonyms appear in text."""
+            for alias in _get_synonym_group(keyword):
+                if keyword_present(alias, text):
+                    return True
+            return False
+
+        # ── Detect resume type: non-tech resumes use SKILLS SUMMARY (plain bullets),
+        # tech resumes use TECHNICAL SKILLS (Category: item lists).
+        # This changes what drives the coverage score:
+        #   Tech:     tier1 hard skills coverage (are the required tools in the resume?)
+        #   Non-tech: tier2 soft skill coverage (are the required concepts demonstrated?)
+        # is_non_tech_resume already set above before summary rewrite — reused here for scoring
+        # is_non_tech_resume = bool(original_skills_summary_bullets)
+
+        tier1_injectable      = [kw for kw in tier1_keywords if keyword_present_with_synonyms(kw, normalized_original_text)]
+        tier1_gap             = [kw for kw in tier1_keywords if not keyword_present_with_synonyms(kw, normalized_original_text)]
+        tier1_matched         = [kw for kw in tier1_injectable if keyword_present_with_synonyms(kw, normalized_resume_text)]
+        injected_keyword_list = [kw for kw in tier1_keywords
+                                 if keyword_present_with_synonyms(kw, normalized_resume_text)
+                                 and not keyword_present_with_synonyms(kw, normalized_original_text)]
+
+        if is_non_tech_resume:
+            # Non-tech: tier1 + tier2 combined.
+            # Tier1 captures real tools (Excel, Office 365, POS systems).
+            # Tier2 captures soft skill concepts (fast-paced, customer service, etc).
+            # Both matter for non-tech ATS scoring.
+            tier2_matched       = [kw for kw in tier2_keywords if keyword_present_with_synonyms(kw, normalized_resume_text)]
+            tier2_gap           = [kw for kw in tier2_keywords if not keyword_present_with_synonyms(kw, normalized_resume_text)]
+            keyword_match_count = len(tier1_matched) + len(tier2_matched)
+            keyword_total_count = len(tier1_injectable) + len(tier2_keywords)
+        else:
+            # Tech: tier1 only — hard skills are the only meaningful signal.
+            tier2_matched = []
+            tier2_gap     = []
+            keyword_match_count = len(tier1_matched)
+            keyword_total_count = len(tier1_injectable)
         keyword_injection_count = len(injected_keyword_list)
-        missing_keywords = list(dict.fromkeys(missing_keywords))
-        original_resume_keywords = list(dict.fromkeys(original_resume_keywords))
+
+        tier1_injectable      = list(dict.fromkeys(tier1_injectable))
+        tier1_gap             = list(dict.fromkeys(tier1_gap))
+        tier1_matched         = list(dict.fromkeys(tier1_matched))
         injected_keyword_list = list(dict.fromkeys(injected_keyword_list))
 
         # ── Final event (100%)
@@ -1130,22 +1751,23 @@ JSON:"""
             "output_filename":       output_filename,
             "cover_letter_filename": cover_filename_out,
             "scoring": {
-                "tier1_keywords":          tier1_keywords,
-                "tier2_keywords":          tier2_keywords,
-                "excluded_kws":            excluded_kws,
-                "tier2_injections_fired":  len(used_tier2),
-                "keyword_injection_count": keyword_injection_count,
-                "job_text_length":         len(job_text),
-                "injected_tier2":          list(used_tier2),
-                "quantified_bullets":      quantified_bullets,
-                "total_bullets":           total_bullets,
-                "quantification_rate":     quantification_rate,
-                "matched_keywords":        keyword_match_count,
-                "total_keywords":          keyword_total_count,
-                "matched_keyword_list":    matched_scoring_keywords,
-                "original_resume_keywords": original_resume_keywords,
-                "injected_keywords":       injected_keyword_list,
-                "missing_keywords":        missing_keywords,
+                "tier1_keywords":           tier1_keywords,
+                "tier2_keywords":           tier2_keywords,
+                "excluded_kws":             excluded_kws,
+                "keyword_injection_count":  keyword_injection_count,
+                "job_text_length":          len(job_text),
+                "quantified_bullets":       quantified_bullets,
+                "total_bullets":            total_bullets,
+                "quantification_rate":      quantification_rate,
+                "matched_keywords":         keyword_match_count,
+                "total_keywords":           keyword_total_count,
+                "tier1_injectable":         tier1_injectable,
+                "tier1_gap":                tier1_gap,
+                "tier1_matched":            tier1_matched,
+                "tier2_matched":            tier2_matched,
+                "tier2_gap":                tier2_gap,
+                "is_non_tech_resume":       is_non_tech_resume,
+                "injected_keywords":        injected_keyword_list,
             }
         }
 
@@ -1156,6 +1778,16 @@ JSON:"""
     except HTTPException:
         raise
     except Exception as e:
+        err_str = str(e)
+        if "Rate limit hit" in err_str:
+            import re as _re
+            m = _re.search(r'retry in (\d+)s', err_str)
+            retry_secs = int(m.group(1)) if m else 60
+            print(f"[tailor_resume] rate limit — returning 429 retry_after={retry_secs}s")
+            raise HTTPException(
+                status_code=429,
+                detail=json.dumps({"rate_limited": True, "retry_after": retry_secs})
+            )
         print(f"Unexpected error in tailor_resume: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1430,23 +2062,23 @@ def _build_resume_pdf(data: dict, output_path: str):
         fontSize=9.5,
         spaceBefore=4,
         spaceAfter=1.5,
-        leading=12,
+        leading=11,   # tight single-spacing — matches original resume
     )
     bullet_style = ParagraphStyle(
         "Bullet",
         fontName="Helvetica",
-        fontSize=9,
+        fontSize=9.5,  # bumped from 9 for readability
         leftIndent=12,
         firstLineIndent=0,
         spaceAfter=1,
-        leading=10,
+        leading=10.5,  # proportional to font bump
     )
     skills_style = ParagraphStyle(
         "Skills",
         fontName="Helvetica",
-        fontSize=9,
+        fontSize=9.5,  # bumped from 9 for readability
         spaceAfter=1.5,
-        leading=10,
+        leading=10.5,  # proportional to font bump
     )
 
     hyperlinks = data.get("hyperlinks", {})
@@ -1492,12 +2124,13 @@ def _build_resume_pdf(data: dict, output_path: str):
             spaceAfter=3,
         ))
 
-        is_summary = "SUMMARY" in title_upper
+        is_summary = "SUMMARY" in title_upper and "SKILL" not in title_upper
 
         for entry in section.get("entries", []):
             heading    = as_str(entry.get("heading"))
             subheading = as_str(entry.get("subheading"))
             bullets    = normalize_list_of_strings(entry.get("bullets"))
+            _plain_skill_bullets: list[str] = []  # collected for 2-col flush after loop
 
             # ── Heading ───────────────────────────────────────────────────────
             if not is_skills and heading:
@@ -1540,17 +2173,24 @@ def _build_resume_pdf(data: dict, output_path: str):
                         story.append(Paragraph(safe_xml(b_clean), summary_body_style))
 
                 elif is_skills:
+                    _non_skill_prefixes = {
+                        "email", "phone", "tel", "address", "linkedin", "github",
+                        "portfolio", "website", "url", "name", "gpa", "university",
+                        "college", "school", "location", "city",
+                    }
                     m = re.match(r"^([A-Za-z0-9 &/+-]+:)\s*(.*)$", b)
-                    if m:
+                    if m and m.group(1).rstrip(":").strip().lower() not in _non_skill_prefixes:
                         label_part = safe_xml(m.group(1))
                         value_part = safe_xml(m.group(2))
                         story.append(Paragraph(
                             f"<b>{label_part}</b> {value_part}",
                             skills_style,
                         ))
-                    else:
-                        # Plain bullet skills (e.g. Skills Summary section)
-                        story.append(Paragraph(safe_xml(b), skills_style))
+                    elif not m:
+                        # Plain bullet — collected below for 2-col table (SKILLS SUMMARY)
+                        _plain_skill_bullets.append(b)
+                        continue
+                    # else: matched but was a contact/header line — silently skip it
 
                 elif is_edu:
                     story.append(Paragraph(safe_xml(b), entry_sub_style))
@@ -1561,6 +2201,65 @@ def _build_resume_pdf(data: dict, output_path: str):
                         bullet_style,
                         bulletText="•",
                     ))
+
+            # ── Flush plain skill bullets as 2-column table (SKILLS SUMMARY) ──────
+            if _plain_skill_bullets:
+                from reportlab.platypus import Table, TableStyle
+                from reportlab.lib import colors as rl_colors
+                col_bullet_style = ParagraphStyle(
+                    "ColBullet",
+                    fontName="Helvetica",
+                    fontSize=9.5,
+                    leading=12,
+                    leftIndent=8,
+                )
+                usable_width = doc.width
+                col_w = usable_width / 2
+                # Estimate max chars that fit in a single column at current font size
+                # Helvetica ~0.55 width ratio at fontSize 9.5
+                _max_col_chars = int(col_w / (col_bullet_style.fontSize * 0.55))
+
+                # Separate items that are too long for a half-width column
+                short_items = [b for b in _plain_skill_bullets if len(b) <= _max_col_chars]
+                long_items  = [b for b in _plain_skill_bullets if len(b) >  _max_col_chars]
+
+                # Build table: long items span full width, short items pair in 2 cols
+                # Interleave short items: longest with shortest to balance row heights
+                sorted_short = sorted(short_items, key=len, reverse=True)
+                mid = (len(sorted_short) + 1) // 2
+                left_col  = sorted_short[:mid]
+                right_col = sorted_short[mid:][::-1]
+                while len(right_col) < len(left_col):
+                    right_col.append("")
+
+                table_data = []
+                span_rows: list[int] = []
+
+                # Add long items as full-width spanned rows first
+                for item in long_items:
+                    span_rows.append(len(table_data))
+                    full_para = Paragraph(f"• {safe_xml(item)}", col_bullet_style)
+                    table_data.append([full_para, Paragraph("", col_bullet_style)])
+
+                # Add paired short items
+                for l, r in zip(left_col, right_col):
+                    l_para = Paragraph(f"• {safe_xml(l)}", col_bullet_style) if l else Paragraph("", col_bullet_style)
+                    r_para = Paragraph(f"• {safe_xml(r)}", col_bullet_style) if r else Paragraph("", col_bullet_style)
+                    table_data.append([l_para, r_para])
+
+                tbl = Table(table_data, colWidths=[col_w, col_w])
+                style_cmds = [
+                    ("VALIGN",        (0, 0), (-1, -1), "TOP"),
+                    ("LEFTPADDING",   (0, 0), (-1, -1), 2),
+                    ("RIGHTPADDING",  (0, 0), (-1, -1), 4),
+                    ("TOPPADDING",    (0, 0), (-1, -1), 1),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 1),
+                ]
+                # Span full-width rows across both columns
+                for row_idx in span_rows:
+                    style_cmds.append(("SPAN", (0, row_idx), (1, row_idx)))
+                tbl.setStyle(TableStyle(style_cmds))
+                story.append(tbl)
 
         story.append(Spacer(1, 2))
 

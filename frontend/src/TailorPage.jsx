@@ -2,6 +2,15 @@ import { useState, useEffect } from 'react'
 
 const API = '/api'
 
+function getToken() { return localStorage.getItem('adaptiq_token') }
+function authFetch(url, options = {}) {
+  const token = getToken()
+  return fetch(url, {
+    ...options,
+    headers: { ...(options.headers || {}), ...(token ? { 'X-Auth-Token': token } : {}) },
+  })
+}
+
 export default function TailorPage({ resumeFilename, onBack, onProceed, errorMessage}) {
   const [activeTab, setActiveTab] = useState('url')
   const [panelOpen, setPanelOpen] = useState(false)
@@ -16,7 +25,7 @@ export default function TailorPage({ resumeFilename, onBack, onProceed, errorMes
 
   const fetchQuota = async () => {
     try {
-      const res = await fetch(`${API}/gemini-quota`)
+      const res = await authFetch(`${API}/gemini-quota`)
       if (res.ok) setQuota(await res.json())
     } catch { /* silently ignore */ }
   }
@@ -41,7 +50,7 @@ export default function TailorPage({ resumeFilename, onBack, onProceed, errorMes
     setShowPreview(false)
 
     try {
-      const res = await fetch(`${API}/fetch-job-url`, {
+      const res = await authFetch(`${API}/fetch-job-url`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: trimmed }),
@@ -71,6 +80,11 @@ export default function TailorPage({ resumeFilename, onBack, onProceed, errorMes
 
   return (
     <div style={styles.layout}>
+      {/* Ambient orbs */}
+      <div style={{ position: 'fixed', inset: 0, pointerEvents: 'none', zIndex: 0, overflow: 'hidden' }}>
+        <div style={{ position: 'absolute', top: '-10%', right: '-5%', width: 600, height: 600, background: 'radial-gradient(circle, rgba(139,92,246,0.09) 0%, transparent 65%)', filter: 'blur(70px)' }} />
+        <div style={{ position: 'absolute', bottom: '-15%', left: '-8%', width: 700, height: 700, background: 'radial-gradient(circle, rgba(61,110,246,0.08) 0%, transparent 65%)', filter: 'blur(70px)' }} />
+      </div>
       <style>{`
         .file-chip:hover { border-color: rgba(255,255,255,0.25) !important; background: var(--surface-raised) !important; }
         .back-btn:hover { background: rgba(255,255,255,0.08) !important; border-color: rgba(255,255,255,0.25) !important; color: #ffffff !important; box-shadow: 0 0 0 1px rgba(255,255,255,0.12) !important; transform: translateY(-1px) !important; }
@@ -79,6 +93,8 @@ export default function TailorPage({ resumeFilename, onBack, onProceed, errorMes
         .preview-toggle:hover,
         .toggle-item:not(:disabled):hover { background: rgba(255,255,255,0.08) !important; border-color: rgba(255,255,255,0.25) !important; color: #ffffff !important; box-shadow: 0 0 0 1px rgba(255,255,255,0.12) !important; transform: translateY(-1px) !important; }
         .proceed-btn:hover { filter: brightness(1.12); }
+        .proceed-btn-active { box-shadow: 0 0 28px rgba(108,99,255,0.38), 0 4px 16px rgba(108,99,255,0.22) !important; }
+        .proceed-btn-active:hover { box-shadow: 0 0 40px rgba(108,99,255,0.5), 0 6px 20px rgba(108,99,255,0.3) !important; filter: brightness(1.08); }
         .url-clear-btn { color: var(--danger) !important; transition: all 0.15s; }
         .url-clear-btn:hover { color: #fff !important; background: var(--danger) !important; }
         .desc-clear-btn { transition: all 0.15s; }
@@ -88,8 +104,8 @@ export default function TailorPage({ resumeFilename, onBack, onProceed, errorMes
       <header style={styles.header}>
         <div style={styles.headerInner}>
           <div style={styles.logo}>
-            <span style={styles.logoIcon}>⌂</span>
-            <span style={styles.logoText}>resume<em style={styles.logoAccent}>tailor</em></span>
+            <img src="/AdaptIQ_Logo.png" alt="AdaptIQ" style={{ height: 28, width: 'auto' }} />
+            <span style={styles.logoText}>Adapt<em style={styles.logoAccent}>IQ</em></span>
           </div>
           <span style={styles.headerTag}>personal workspace</span>
         </div>
@@ -344,14 +360,21 @@ export default function TailorPage({ resumeFilename, onBack, onProceed, errorMes
         <section style={styles.section}>
           {/* Gemini quota indicator */}
           {quota && (() => {
-            const pct     = quota.remaining / quota.limit
-            const hrs     = Math.floor(quota.resets_in_s / 3600)
-            const mins    = Math.floor((quota.resets_in_s % 3600) / 60)
+            // Daily bar
+            const pct      = quota.remaining / quota.limit
+            const hrs      = Math.floor(quota.resets_in_s / 3600)
+            const mins     = Math.floor((quota.resets_in_s % 3600) / 60)
             const resetStr = hrs > 0 ? `${hrs}h ${mins}m` : `${mins}m`
-            const color   = pct > 0.4 ? 'var(--success)' : pct > 0.1 ? '#f0a500' : 'var(--danger)'
-            const barW    = Math.max(2, Math.round(pct * 100))
+            const color    = pct > 0.4 ? 'var(--success)' : pct > 0.1 ? '#f0a500' : 'var(--danger)'
+            const barW     = Math.max(2, Math.round(pct * 100))
+            // RPM bar
+            const rpmPct   = quota.rpm_remaining / quota.rpm_limit
+            const rpmColor = rpmPct > 0.4 ? 'var(--success)' : rpmPct > 0.1 ? '#f0a500' : 'var(--danger)'
+            const rpmBarW  = Math.max(2, Math.round(rpmPct * 100))
+            const rpmReset = quota.rpm_reset_s > 0 ? `${quota.rpm_reset_s}s` : 'now'
             return (
               <div style={styles.quotaBar}>
+                {/* Daily */}
                 <div style={styles.quotaTop}>
                   <span style={styles.quotaLabel}>
                     <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{marginRight:5,opacity:0.7}}>
@@ -367,12 +390,33 @@ export default function TailorPage({ resumeFilename, onBack, onProceed, errorMes
                   <div style={{ ...styles.quotaFill, width: `${barW}%`, background: color }} />
                 </div>
                 <span style={styles.quotaReset}>resets in {resetStr}</span>
+
+                {/* RPM — the real bottleneck */}
+                <div style={{ ...styles.quotaTop, marginTop: 8 }}>
+                  <span style={styles.quotaLabel}>
+                    <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{marginRight:5,opacity:0.7}}>
+                      <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
+                    </svg>
+                    gemini api · per-minute usage
+                  </span>
+                  <span style={{ ...styles.quotaCount, color: rpmColor }}>
+                    {quota.rpm_remaining} / {quota.rpm_limit} remaining
+                  </span>
+                </div>
+                <div style={styles.quotaTrack}>
+                  <div style={{ ...styles.quotaFill, width: `${rpmBarW}%`, background: rpmColor }} />
+                </div>
+                <span style={styles.quotaReset}>
+                  {quota.rpm_remaining === 0
+                    ? `rate limited — clears in ${rpmReset}`
+                    : `resets in ${rpmReset}`}
+                </span>
               </div>
             )
           })()}
 
           <button
-            className= "proceed-btn"
+            className={isReadyToProceed ? "proceed-btn proceed-btn-active" : "proceed-btn"}
             style={{ ...styles.proceedBtn, ...(isReadyToProceed ? styles.proceedBtnActive : styles.proceedBtnDisabled) }}
             disabled={!isReadyToProceed}
             onClick={() => {
@@ -396,7 +440,7 @@ export default function TailorPage({ resumeFilename, onBack, onProceed, errorMes
       </main>
 
       <footer style={styles.footer}>
-        <span style={styles.footerText}>resume tailor · personal workspace</span>
+        <span style={styles.footerText}>AdaptIQ · personal workspace</span>
       </footer>
       {/* PDF side panel — same pattern as HistoryPage */}
       {panelOpen && (
@@ -463,9 +507,9 @@ const styles = {
   header: { borderBottom: '1px solid var(--border)', padding: '0 24px' },
   headerInner: { maxWidth: 680, margin: '0 auto', height: 60, display: 'flex', alignItems: 'center', justifyContent: 'space-between' },
   logo: { display: 'flex', alignItems: 'center', gap: 8 },
-  logoIcon: { fontSize: 18, color: 'var(--accent)' },
+  logoIcon: { height: 28, width: 'auto' },
   logoText: { fontFamily: 'var(--font-display)', fontSize: 20, color: 'var(--text-primary)', letterSpacing: '-0.02em' },
-  logoAccent: { fontStyle: 'italic', color: 'var(--accent)' },
+  logoAccent: { fontStyle: 'normal', background: 'var(--accent-gradient)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent', backgroundClip: 'text' },
   headerTag: { fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--text-muted)', letterSpacing: '0.08em', textTransform: 'uppercase' },
   main: { flex: 1, maxWidth: 680, width: '100%', margin: '0 auto', padding: '40px 24px 80px', display: 'flex', flexDirection: 'column', gap: 40 },
   topBar: { display: 'flex', alignItems: 'center', justifyContent: 'space-between' },
@@ -502,7 +546,7 @@ const styles = {
   inputHint: { fontSize: 12, color: 'var(--text-muted)', fontFamily: 'var(--font-mono)' },
   textarea: { width: '100%', minHeight: 220, background: 'var(--surface-raised)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', color: 'var(--text-primary)', fontSize: 14, fontFamily: 'var(--font-body)', lineHeight: 1.6, padding: '14px', resize: 'vertical', outline: 'none', boxSizing: 'border-box' },
   proceedBtn: { display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10, width: '100%', padding: '14px 24px', borderRadius: 'var(--radius)', border: 'none', fontSize: 14, fontFamily: 'var(--font-body)', fontWeight: 600, cursor: 'pointer', transition: 'all 0.2s ease' },
-  proceedBtnActive: { background: 'var(--accent)', color: '#0e0f11' },
+  proceedBtnActive: { background: 'var(--accent)', color: '#ffffff' },
   proceedBtnDisabled: { background: 'var(--surface-raised)', color: 'var(--text-muted)', cursor: 'not-allowed', border: '1px solid var(--border)' },
   footer: { borderTop: '1px solid var(--border)', padding: '16px 24px', textAlign: 'center' },
   footerText: { fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--text-muted)', letterSpacing: '0.06em' },
@@ -541,7 +585,7 @@ const styles = {
     flexShrink: 0, transition: 'all 0.15s',
   },
   toggleCheckOn: {
-    background: 'var(--accent)', borderColor: 'var(--accent)', color: '#0e0f11',
+    background: 'var(--accent)', borderColor: 'var(--accent)', color: '#ffffff',
   },
   toggleContent: {
     display: 'flex', flexDirection: 'column', gap: 2,

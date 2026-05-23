@@ -1,6 +1,19 @@
+# Secrets
+.env
 api key.txt
+
+# Python
 __pycache__/
 *.pyc
+*.pyo
+
+# Node
 node_modules/
-.env
+frontend/dist/
+
+# Logs
 *.log
+
+# Resume files — personal data
+backend/uploads/
+backend/outputs/

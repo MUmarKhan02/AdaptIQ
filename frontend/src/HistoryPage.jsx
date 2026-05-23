@@ -2,6 +2,15 @@ import { useState, useEffect, useCallback } from 'react'
 
 const API = '/api'
 
+function getToken() { return localStorage.getItem('adaptiq_token') }
+function authFetch(url, options = {}) {
+  const token = getToken()
+  return fetch(url, {
+    ...options,
+    headers: { ...(options.headers || {}), ...(token ? { 'X-Auth-Token': token } : {}) },
+  })
+}
+
 function formatDate(iso) {
   return new Date(iso).toLocaleDateString('en-CA', {
     month: 'short', day: 'numeric', year: 'numeric',
@@ -264,7 +273,7 @@ export default function HistoryPage({ onBack }) {
 
   const fetchResumeHistory = useCallback(async () => {
     try {
-      const res = await fetch(`${API}/history`)
+      const res = await authFetch(`${API}/history`)
       const data = await res.json()
       setResumeHistory(data.history)
       if (data.ttl_days) setResumeTtl(data.ttl_days)
@@ -274,7 +283,7 @@ export default function HistoryPage({ onBack }) {
 
   const fetchClHistory = useCallback(async () => {
     try {
-      const res = await fetch(`${API}/history-cl`)
+      const res = await authFetch(`${API}/history-cl`)
       const data = await res.json()
       setClHistory(data.history)
       if (data.ttl_days) setClTtl(data.ttl_days)
@@ -310,11 +319,11 @@ export default function HistoryPage({ onBack }) {
     const c = resumeConfirm; setResumeConfirm(null)
     if (c.type === 'one') {
       setResumeDeleting(c.filename)
-      try { await fetch(`${API}/history/${encodeURIComponent(c.filename)}`, { method: 'DELETE' }); setResumeHistory(h => h.filter(f => f.filename !== c.filename)) }
+      try { await authFetch(`${API}/history/${encodeURIComponent(c.filename)}`, { method: 'DELETE' }); setResumeHistory(h => h.filter(f => f.filename !== c.filename)) }
       finally { setResumeDeleting(null) }
     } else {
       setResumeDeleting('all')
-      try { await fetch(`${API}/history`, { method: 'DELETE' }); setResumeHistory([]); setResumeSelected(null) }
+      try { await authFetch(`${API}/history`, { method: 'DELETE' }); setResumeHistory([]); setResumeSelected(null) }
       finally { setResumeDeleting(null) }
     }
   }
@@ -331,11 +340,11 @@ export default function HistoryPage({ onBack }) {
     const c = clConfirm; setClConfirm(null)
     if (c.type === 'one') {
       setClDeleting(c.filename)
-      try { await fetch(`${API}/history-cl/${encodeURIComponent(c.filename)}`, { method: 'DELETE' }); setClHistory(h => h.filter(f => f.filename !== c.filename)) }
+      try { await authFetch(`${API}/history-cl/${encodeURIComponent(c.filename)}`, { method: 'DELETE' }); setClHistory(h => h.filter(f => f.filename !== c.filename)) }
       finally { setClDeleting(null) }
     } else {
       setClDeleting('all')
-      try { await fetch(`${API}/history-cl`, { method: 'DELETE' }); setClHistory([]); setClSelected(null) }
+      try { await authFetch(`${API}/history-cl`, { method: 'DELETE' }); setClHistory([]); setClSelected(null) }
       finally { setClDeleting(null) }
     }
   }
@@ -352,6 +361,11 @@ export default function HistoryPage({ onBack }) {
 
   return (
     <div style={styles.layout}>
+      {/* Ambient orbs */}
+      <div style={{ position: 'fixed', inset: 0, pointerEvents: 'none', zIndex: 0, overflow: 'hidden' }}>
+        <div style={{ position: 'absolute', top: '-10%', right: '-5%', width: 600, height: 600, background: 'radial-gradient(circle, rgba(108,99,255,0.08) 0%, transparent 65%)', filter: 'blur(70px)' }} />
+        <div style={{ position: 'absolute', bottom: '-10%', left: '-8%', width: 600, height: 600, background: 'radial-gradient(circle, rgba(61,110,246,0.07) 0%, transparent 65%)', filter: 'blur(70px)' }} />
+      </div>
       <style>{`
     .hist-card { -webkit-tap-highlight-color: transparent; }
     .hist-card:focus { outline: none; }
@@ -375,8 +389,8 @@ export default function HistoryPage({ onBack }) {
       <header style={styles.header}>
         <div style={styles.headerInner}>
           <div style={styles.logo}>
-            <span style={styles.logoIcon}>⌂</span>
-            <span style={styles.logoText}>resume<em style={styles.logoAccent}>tailor</em></span>
+            <img src="/AdaptIQ_Logo.png" alt="AdaptIQ" style={{ height: 28, width: 'auto' }} />
+            <span style={styles.logoText}>Adapt<em style={styles.logoAccent}>IQ</em></span>
           </div>
           <span style={styles.headerTag}>personal workspace</span>
         </div>
@@ -504,9 +518,9 @@ const styles = {
   header: { borderBottom: '1px solid var(--border)', padding: '0 24px', flexShrink: 0 },
   headerInner: { maxWidth: '100%', height: 60, display: 'flex', alignItems: 'center', justifyContent: 'space-between' },
   logo: { display: 'flex', alignItems: 'center', gap: 8 },
-  logoIcon: { fontSize: 18, color: 'var(--accent)' },
+  logoIcon: { height: 28, width: 'auto' },
   logoText: { fontFamily: 'var(--font-display)', fontSize: 20, color: 'var(--text-primary)', letterSpacing: '-0.02em' },
-  logoAccent: { fontStyle: 'italic', color: 'var(--accent)' },
+  logoAccent: { fontStyle: 'normal', background: 'var(--accent-gradient)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent', backgroundClip: 'text' },
   headerTag: { fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--text-muted)', letterSpacing: '0.08em', textTransform: 'uppercase' },
 
   body: { flex: 1, display: 'flex', overflow: 'hidden', position: 'relative' },
@@ -530,7 +544,7 @@ const styles = {
   clearAllBtn: { background: 'none', border: '1px solid rgba(255, 95, 87, 0.7)', borderRadius: 6, padding: '7px 14px', fontSize: 12, color: 'var(--danger)', cursor: 'pointer', fontFamily: 'var(--font-body)', fontWeight: 500, outline: 'none', WebkitTapHighlightColor: 'transparent' },
   btnDisabled: { opacity: 0.4, cursor: 'default', pointerEvents: 'none' },
 
-  retentionNote: { display: 'flex', alignItems: 'flex-start', gap: 8, padding: '9px 13px', background: 'rgba(200,240,76,0.05)', border: '1px solid rgba(200,240,76,0.15)', borderRadius: 'var(--radius-sm, 6px)', fontSize: 11, fontFamily: 'var(--font-mono)', color: 'var(--text-muted)', lineHeight: 1.5 },
+  retentionNote: { display: 'flex', alignItems: 'flex-start', gap: 8, padding: '9px 13px', background: 'rgba(108,99,255,0.08)', border: '1px solid rgba(108,99,255,0.2)', borderRadius: 'var(--radius-sm, 6px)', fontSize: 11, fontFamily: 'var(--font-mono)', color: 'var(--text-muted)', lineHeight: 1.5 },
 
   emptyState: { display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 10, padding: '64px 24px', background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 'var(--radius)', textAlign: 'center' },
   emptyIcon: { color: 'var(--text-muted)', marginBottom: 4 },

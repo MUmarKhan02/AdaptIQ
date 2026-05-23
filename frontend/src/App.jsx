@@ -1,9 +1,25 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import TailorPage from './TailorPage'
 import LoadingScreen from './LoadingScreen'
+import LoginPage from './LoginPage'
+import SplashPage from './SplashPage'
 import HistoryPage from './HistoryPage'
 
 const API = '/api'
+
+// ── Auth helpers ──────────────────────────────────────────────────────────────
+function getToken() { return localStorage.getItem('adaptiq_token') }
+
+function authFetch(url, options = {}) {
+  const token = getToken()
+  return fetch(url, {
+    ...options,
+    headers: {
+      ...(options.headers || {}),
+      ...(token ? { 'X-Auth-Token': token } : {}),
+    },
+  })
+}
 
 function formatDate(iso) {
   return new Date(iso).toLocaleDateString('en-CA', {
@@ -19,33 +35,44 @@ function formatSize(kb) {
 // ── Score Panel ───────────────────────────────────────────────────────────────
 function ScorePanel({ scoring, jobText, onClose }) {
   const s = scoring || {}
-  const tier1Keywords     = s.tier1_keywords     || []
-  const tier2Keywords     = s.tier2_keywords     || []
-  const originalKeywords  = s.original_resume_keywords || []
-  const injectedKeywords  = s.injected_keywords       || []
-  const missingKeywords   = s.missing_keywords        || []
-  const injected          = s.keyword_injection_count ?? s.anchor_rules_fired ?? injectedKeywords.length
-  const jobLen            = s.job_text_length    || 0
+  const tier1Keywords     = s.tier1_keywords    || []
+  const tier2Keywords     = s.tier2_keywords    || []
+  const tier1Injectable   = s.tier1_injectable  || []
+  const tier1Gap          = s.tier1_gap         || []
+  const tier1Matched      = s.tier1_matched     || []
+  const tier2Matched      = s.tier2_matched     || []
+  const tier2Gap          = s.tier2_gap         || []
+  const isNonTech         = s.is_non_tech_resume || false
+  const injectedKeywords  = s.injected_keywords || []
+  const injected          = injectedKeywords.length
+  const jobLen            = s.job_text_length   || 0
   const quantifiedBullets = s.quantified_bullets || 0
   const totalBullets      = s.total_bullets      || 0
   const quantScore        = s.quantification_rate || 0
-  const matchedKeywords   = s.matched_keywords   || (originalKeywords.length + injectedKeywords.length)
-  const totalKeywords     = s.total_keywords     || 0
-  const allKw             = [...tier1Keywords, ...tier2Keywords]
 
-  // ── Compute scores ──────────────────────────────────────────────────────────
-  // 1. ATS Structure — always high since we control the PDF builder
+  // ── Compute scores — tier2 is NEVER a scoring input ─────────────────────────
+  // 1. ATS Structure
   const atsScore = 92
 
-  // 2. Keyword Injection — how many anchor rules fired vs total possible
-  const MAX_ANCHORS = 14
-  const injectionScore = Math.min(100, Math.round(40 + (injected / MAX_ANCHORS) * 60))
+  // 2. Tailoring Accuracy — of tier1 skills that were injectable (in original resume),
+  // how many are confirmed present in the tailored output?
+  // 0 injectable opportunities = 100 (nothing to do = done correctly).
+  const tailoringScore = tier1Injectable.length === 0
+    ? 100
+    : Math.min(100, Math.round((tier1Matched.length / tier1Injectable.length) * 100))
 
-  // 3. Keyword Coverage — actual keyword injection success, excluding JD keywords not in the tailored resume
-  const coverageDenominator = Math.max(0, totalKeywords - missingKeywords.length)
-  const kwMatchScore = coverageDenominator > 0
-    ? Math.min(100, Math.round((injectedKeywords.length / coverageDenominator) * 100))
-    : 100
+  // 3. Keyword Coverage — differs by resume type:
+  //   Tech resume:     tier1 hard skill coverage (are required tools present?)
+  //   Non-tech resume: tier2 soft skill coverage (are required concepts demonstrated?)
+  const totalTier1 = tier1Keywords.length
+  const totalTier2 = tier2Keywords.length
+  // Non-tech: (tier1_matched + tier2_matched) / (tier1_injectable + tier2_total) — tools + soft skills
+  // Tech:     tier1_matched / tier1_injectable — hard skills only
+  const nonTechTotal   = tier1Injectable.length + totalTier2
+  const nonTechMatched = tier1Matched.length + tier2Matched.length
+  const kwMatchScore = isNonTech
+    ? (nonTechTotal === 0 ? 100 : Math.min(100, Math.round((nonTechMatched / nonTechTotal) * 100)))
+    : (totalTier1 === 0   ? 100 : Math.min(100, Math.round((tier1Matched.length / totalTier1) * 100)))
 
   // 4. Quantification Rate — percent of bullets with measurable metrics
   const quantificationScore = quantScore
@@ -57,7 +84,7 @@ function ScorePanel({ scoring, jobText, onClose }) {
   // 6. Overall weighted score
   const overall = Math.round(
     atsScore            * 0.20 +
-    injectionScore      * 0.20 +
+    tailoringScore      * 0.20 +
     kwMatchScore        * 0.25 +
     quantificationScore * 0.15 +
     jobMatchScore       * 0.20
@@ -75,7 +102,7 @@ function ScorePanel({ scoring, jobText, onClose }) {
         <circle cx={size/2} cy={size/2} r={r} fill="none" stroke={scoreColor(value)} strokeWidth={stroke}
           strokeLinecap="round" strokeDasharray={circ} strokeDashoffset={offset}
           transform={`rotate(-90 ${size/2} ${size/2})`}
-          style={{ transition: 'stroke-dashoffset 0.8s ease' }}
+          style={{ transition: 'stroke-dashoffset 0.8s ease', filter: `drop-shadow(0 0 4px ${scoreColor(value)}99)` }}
         />
         <text x="50%" y="50%" dominantBaseline="central" textAnchor="middle"
           fill="var(--text-primary)" fontSize={size * 0.22} fontFamily="var(--font-display)" fontWeight="bold">
@@ -160,14 +187,18 @@ function ScorePanel({ scoring, jobText, onClose }) {
               detail="Single-column layout, embedded fonts, standard headings, plain text bullets"
             />
             <ScoreRow
-              label="Keyword Injection"
-              value={injectionScore}
-              detail={`${injected} new job keywords injected into resume content`}
+              label="Tailoring Accuracy"
+              value={tailoringScore}
+              detail={tier1Injectable.length === 0
+                ? "No injectable keywords found — resume correctly unchanged"
+                : `${tier1Matched.length} of ${tier1Injectable.length} injectable keywords confirmed in output`}
             />
             <ScoreRow
               label="Keyword Coverage"
               value={kwMatchScore}
-              detail={`${matchedKeywords} of ${totalKeywords} job keywords matched in resume content`}
+              detail={isNonTech
+                ? `${nonTechMatched} of ${nonTechTotal} skills & concepts covered`
+                : `${tier1Matched.length} of ${totalTier1} required technical skills covered`}
             />
             <ScoreRow
               label="Quantification Rate"
@@ -216,26 +247,25 @@ function ScorePanel({ scoring, jobText, onClose }) {
             </div>
           )}
 
-          {missingKeywords.length > 0 && (
+          {(isNonTech ? tier2Gap : tier1Gap).length > 0 && (
             <div style={{ marginBottom: 20 }}>
               <div style={{ fontFamily: 'var(--font-mono)', fontSize: 10, letterSpacing: '0.1em', textTransform: 'uppercase', color: 'var(--text-muted)', marginBottom: 8 }}>Skills Gap — Not in Resume</div>
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-                {missingKeywords.map((kw, i) => {
-                  const isTier1 = tier1Keywords.includes(kw)
-                  return (
-                    <span key={i} style={{
-                      fontSize: 11, padding: '3px 8px', borderRadius: 4,
-                      background: isTier1 ? 'rgba(255,255,255,0.04)' : 'rgba(255,255,255,0.08)',
-                      border: '1px solid var(--border)',
-                      color: isTier1 ? 'var(--text-muted)' : 'var(--text-secondary)',
-                      fontFamily: 'var(--font-mono)',
-                      opacity: isTier1 ? 0.7 : 1,
-                    }} title={isTier1 ? 'Tier 1 skill — does not reduce coverage score' : 'Tier 2 concept — does not reduce coverage score'}>{kw}</span>
-                  )
-                })}
+                {(isNonTech ? tier2Gap : tier1Gap).map((kw, i) => (
+                  <span key={i} style={{
+                    fontSize: 11, padding: '3px 8px', borderRadius: 4,
+                    background: 'rgba(255,255,255,0.04)',
+                    border: '1px solid var(--border)',
+                    color: 'var(--text-muted)',
+                    fontFamily: 'var(--font-mono)',
+                    opacity: 0.7,
+                  }}>{kw}</span>
+                ))}
               </div>
               <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 6 }}>
-                <em>Missing skills shown for awareness but do not reduce your coverage score</em>
+                <em>{isNonTech
+                  ? 'Soft skill concepts from this JD not clearly demonstrated in your resume'
+                  : 'Hard skills required by this role that are not in your resume'}</em>
               </div>
             </div>
           )}
@@ -259,12 +289,41 @@ function ScorePanel({ scoring, jobText, onClose }) {
           <div>
             <div style={{ fontFamily: 'var(--font-mono)', fontSize: 10, letterSpacing: '0.1em', textTransform: 'uppercase', color: 'var(--text-muted)', marginBottom: 8 }}>Tips</div>
             <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+
+              {/* Application verdict */}
+              {jobLen >= 1000 && (() => {
+                const gapCount   = (isNonTech ? tier2Gap : tier1Gap).length
+                const totalCount = isNonTech ? (tier1Injectable.length + totalTier2) : totalTier1
+                const covered    = isNonTech ? nonTechMatched : tier1Matched.length
+                let verdict, color, icon
+                if (totalCount === 0) return null
+                if (kwMatchScore >= 80) {
+                  verdict = `Strong match — your background covers the core requirements. Worth applying.`
+                  color = 'var(--success)'; icon = '✅'
+                } else if (kwMatchScore >= 60) {
+                  verdict = gapCount > 0
+                    ? `Good match with ${gapCount} gap${gapCount !== 1 ? 's' : ''}. Worth applying — be ready to address missing experience in interviews.`
+                    : `Good match — solid alignment with this role's requirements.`
+                  color = '#f0b429'; icon = '🟡'
+                } else if (kwMatchScore >= 40) {
+                  verdict = `Partial match — ${gapCount} required ${isNonTech ? 'concept' : 'skill'}${gapCount !== 1 ? 's' : ''} not in your resume. Apply if the role genuinely interests you, but expect tough screening questions.`
+                  color = '#f0b429'; icon = '⚠️'
+                } else {
+                  verdict = `Significant gap — this role requires experience outside your current stack. Consider upskilling first or targeting closer matches.`
+                  color = 'var(--danger)'; icon = '🔴'
+                }
+                return (
+                  <div style={{ fontSize: 11, color, background: 'var(--surface)', borderRadius: 6, padding: '8px 12px', lineHeight: 1.5, border: `1px solid ${color}33` }}>
+                    {icon} {verdict}
+                  </div>
+                )
+              })()}
               {jobLen < 1000 && (
                 <div style={{ fontSize: 11, color: 'var(--text-muted)', background: 'var(--surface)', borderRadius: 6, padding: '8px 12px', lineHeight: 1.5, border: '1px solid var(--border)' }}>
                   💡 Paste the full job description for more accurate keyword extraction and a higher score.
                 </div>
               )}
-              {injected < 4 && (
+              {tier1Injectable.length > 0 && tier1Matched.length < tier1Injectable.length * 0.5 && (
                 <div style={{ fontSize: 11, color: 'var(--text-muted)', background: 'var(--surface)', borderRadius: 6, padding: '8px 12px', lineHeight: 1.5, border: '1px solid var(--border)' }}>
                   💡 Fewer rewrites may mean the job is a weaker match for your current experience — consider highlighting more relevant projects first.
                 </div>
@@ -301,8 +360,8 @@ function ResultPage({ filename, pdfUrl, clFilename, clUrl, genResume, genCover, 
       <header style={{ borderBottom: '1px solid var(--border)', padding: '0 24px', flexShrink: 0 }}>
         <div style={{ maxWidth: '100%', height: 60, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <span style={{ fontSize: 18, color: 'var(--accent)' }}>⌂</span>
-            <span style={{ fontFamily: 'var(--font-display)', fontSize: 20, letterSpacing: '-0.02em', color: 'var(--text-primary)' }}>resume<em style={{ fontStyle: 'italic', color: 'var(--accent)' }}>tailor</em></span>
+            <img src="/AdaptIQ_Logo.png" alt="AdaptIQ" style={{ height: 26, width: 'auto',borderRadius: '50%' }} />
+            <span style={{ fontFamily: 'var(--font-display)', fontSize: 20, letterSpacing: '-0.02em', color: 'var(--text-primary)' }}>Adapt<em style={{ fontStyle: 'normal', background: 'var(--accent-gradient)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent', backgroundClip: 'text' }}>IQ</em></span>
           </div>
           {/* Tabs */}
           <div style={{ display: 'flex', gap: 4, background: 'var(--surface)', borderRadius: 10, padding: 4 }}>
@@ -412,7 +471,7 @@ function ResultPage({ filename, pdfUrl, clFilename, clUrl, genResume, genCover, 
           {activeTab === 'resume' ? (
             <>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 12, alignItems: 'center', textAlign: 'center' }}>
-                <div style={{ width: 52, height: 52, borderRadius: '50%', background: 'rgba(200,240,76,0.12)', border: '2px solid var(--accent)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                <div style={{ width: 52, height: 52, borderRadius: '50%', background: 'rgba(108,99,255,0.12)', border: '2px solid var(--accent)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
                   <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
                     <polyline points="20 6 9 17 4 12"/>
                   </svg>
@@ -430,7 +489,7 @@ function ResultPage({ filename, pdfUrl, clFilename, clUrl, genResume, genCover, 
                   href={pdfUrl} download={filename}
                   style={{ 
                     display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, 
-                    background: 'var(--accent)', color: '#0e0f11', border: 'none', borderRadius: 8, 
+                    background: 'var(--accent)', color: '#ffffff', border: 'none', borderRadius: 8, 
                     padding: '12px 20px', fontWeight: 700, fontSize: 13, textDecoration: 'none', 
                     cursor: 'pointer', transition: 'all 0.2s ease',
                     ...(hoveredButton === 'download-resume' ? { filter: 'brightness(1.12)' } : {})
@@ -498,11 +557,16 @@ function ResultPage({ filename, pdfUrl, clFilename, clUrl, genResume, genCover, 
           ) : (
             <>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 12, alignItems: 'center', textAlign: 'center' }}>
-                <div style={{ width: 52, height: 52, borderRadius: '50%', background: clUrl ? 'rgba(200,240,76,0.12)' : 'rgba(200,240,76,0.06)', border: clUrl ? '2px solid var(--accent)' : '2px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                  <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke={clUrl ? 'var(--accent)' : 'var(--text-muted)'} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                    <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
-                    {clUrl && <polyline points="20 6 9 17 4 12"/>}
-                  </svg>
+                <div style={{ width: 52, height: 52, borderRadius: '50%', background: clUrl ? 'rgba(108,99,255,0.12)' : 'rgba(108,99,255,0.08)', border: clUrl ? '2px solid var(--accent)' : '2px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  {clUrl ? (
+                    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                      <polyline points="20 6 9 17 4 12"/>
+                    </svg>
+                  ) : (
+                    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="var(--text-muted)" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+                    </svg>
+                  )}
                 </div>
                 <div>
                   <h2 style={{ fontFamily: 'var(--font-display)', fontSize: 24, letterSpacing: '-0.02em', color: 'var(--text-primary)', marginBottom: 4 }}>
@@ -518,7 +582,7 @@ function ResultPage({ filename, pdfUrl, clFilename, clUrl, genResume, genCover, 
                     href={clUrl} download={clFilename}
                     style={{ 
                       display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, 
-                      background: 'var(--accent)', color: '#0e0f11', border: 'none', borderRadius: 8, 
+                      background: 'var(--accent)', color: '#ffffff', border: 'none', borderRadius: 8, 
                       padding: '12px 20px', fontWeight: 700, fontSize: 13, textDecoration: 'none', 
                       cursor: 'pointer', transition: 'all 0.2s ease',
                       ...(hoveredButton === 'download-cover' ? { filter: 'brightness(1.12)' } : {})
@@ -600,6 +664,10 @@ export default function App() {
   const [confirmDelete, setConfirmDelete] = useState(null) // filename pending confirmation
   const [hoveredResume, setHoveredResume] = useState(null)
   const [previewResume, setPreviewResume] = useState(null)
+  const [token, setToken] = useState(() => getToken())
+  const handleLogout = () => { localStorage.removeItem('adaptiq_token'); setToken(null) }
+  const [showUserMenu, setShowUserMenu] = useState(false)
+  const [splashDone, setSplashDone] = useState(() => !!getToken())
   const fileInputRef = useRef(null)
   const dragCounter = useRef(0)
 
@@ -616,6 +684,20 @@ export default function App() {
   const [tailorResult, setTailorResult] = useState(() => {
     try { const v = sessionStorage.getItem('rt_tailorResult'); return v ? JSON.parse(v) : null } catch { return null }
   })
+
+  const handleLogin = (newToken) => {
+    try {
+      sessionStorage.removeItem('rt_page')
+      sessionStorage.removeItem('rt_selectedResume')
+      sessionStorage.removeItem('rt_jobContext')
+      sessionStorage.removeItem('rt_tailorResult')
+    } catch {}
+    setPage('home')
+    setSelectedResume(null)
+    setJobContext(null)
+    setTailorResult(null)
+    setToken(newToken)
+  }
 
   // Persist state to sessionStorage whenever it changes
   useEffect(() => {
@@ -665,14 +747,16 @@ export default function App() {
   }
 
   const fetchResumes = useCallback(async () => {
+    if (!token) return
     try {
-      const res = await fetch(`${API}/resumes`)
+      const res = await authFetch(`${API}/resumes`)
+      if (!res.ok) return
       const data = await res.json()
-      setResumes(data.resumes)
+      setResumes(data.resumes ?? [])
     } catch {
       // silently fail on list fetch
     }
-  }, [])
+  }, [token])
 
   useEffect(() => { fetchResumes() }, [fetchResumes])
 
@@ -690,7 +774,7 @@ export default function App() {
     formData.append('file', file)
 
     try {
-      const res = await fetch(`${API}/upload-resume`, { method: 'POST', body: formData })
+      const res = await authFetch(`${API}/upload-resume`, { method: 'POST', body: formData })
       const data = await res.json()
       if (!res.ok) throw new Error(data.detail || 'Upload failed')
       setUploadStatus({ type: 'success', message: `"${data.original_name}" saved successfully.` })
@@ -729,7 +813,7 @@ export default function App() {
   const handleDelete = async (filename) => {
     setDeletingFile(filename)
     try {
-      await fetch(`${API}/resumes/${filename}`, { method: 'DELETE' })
+      await authFetch(`${API}/resumes/${filename}`, { method: 'DELETE' })
       if (selectedResume === filename) setSelectedResume(null)
       if (previewResume === filename) setPreviewResume(null)
       fetchResumes()
@@ -737,6 +821,10 @@ export default function App() {
       setDeletingFile(null)
     }
   }
+
+  if (!splashDone) return <SplashPage onEnter={() => setSplashDone(true)} />
+
+  if (!token) return <LoginPage onLogin={handleLogin} />
 
   if (page === 'history') {
     return (
@@ -808,12 +896,24 @@ export default function App() {
 
   return (
     <div style={styles.layout}>
+      {/* Ambient background orbs */}
+      <div style={{ position: 'fixed', inset: 0, pointerEvents: 'none', zIndex: 0, overflow: 'hidden' }}>
+        <div style={{ position: 'absolute', top: '-15%', left: '-8%', width: 700, height: 700, background: 'radial-gradient(circle, rgba(61,110,246,0.10) 0%, transparent 65%)', filter: 'blur(60px)' }} />
+        <div style={{ position: 'absolute', bottom: '-20%', right: '-10%', width: 800, height: 800, background: 'radial-gradient(circle, rgba(139,92,246,0.09) 0%, transparent 65%)', filter: 'blur(60px)' }} />
+        <div style={{ position: 'absolute', top: '45%', left: '55%', width: 400, height: 400, background: 'radial-gradient(circle, rgba(108,99,255,0.05) 0%, transparent 70%)', filter: 'blur(80px)' }} />
+      </div>
        <style>{`
-       .proceed-btn:hover { filter: brightness(1.12); }
-       .dropzone:hover { border-color: rgba(255,255,255,0.25) !important; background: var(--surface-raised) !important; }
+       .proceed-btn-active { box-shadow: 0 0 28px rgba(108,99,255,0.38), 0 4px 16px rgba(108,99,255,0.22) !important; }
+       .proceed-btn-active:hover { filter: brightness(1.1); box-shadow: 0 0 36px rgba(108,99,255,0.5), 0 6px 20px rgba(108,99,255,0.3) !important; }
+       .proceed-btn:hover { filter: brightness(1.08); }
+       .dropzone:hover { border-color: rgba(108,99,255,0.45) !important; background: var(--surface-raised) !important; box-shadow: 0 0 0 1px rgba(108,99,255,0.12), inset 0 0 40px rgba(108,99,255,0.04) !important; }
        .delete-btn:hover { color: #fff !important; border-color: var(--danger) !important; background: var(--danger) !important; }
         .close-btn:hover { color: #fff !important; border-color: var(--danger) !important; background: var(--danger) !important; }
         .history-btn:hover { background: rgba(255,255,255,0.08) !important; border-color: rgba(255,255,255,0.25) !important; color: #ffffff !important; box-shadow: 0 0 0 1px rgba(255,255,255,0.12) !important; transform: translateY(-1px) !important;}
+        .workspace-btn { transition: background 0.2s, border-color 0.2s, color 0.2s, box-shadow 0.2s, transform 0.2s; }
+        .workspace-btn:hover { background: rgba(255,255,255,0.08) !important; border-color: rgba(255,255,255,0.25) !important; color: #ffffff !important; box-shadow: 0 0 0 1px rgba(255,255,255,0.12) !important; transform: translateY(-1px) !important; }
+        .workspace-btn:hover svg { stroke: #ffffff !important; }
+        .signout-btn:hover { background: rgba(255,255,255,0.08) !important; color: #ffffff !important; }
         .view-resume-btn:hover { background: rgba(255,255,255,0.09) !important; border-color: rgba(255,255,255,0.25) !important; color: #ffffff !important; }
         .view-resume-btn-open:hover { opacity: 0.7 !important; }
         @keyframes slideInPanel { from { transform: translateX(100%); } to { transform: translateX(0); } }
@@ -822,8 +922,8 @@ export default function App() {
       <header style={styles.header}>
         <div style={styles.headerInner}>
           <div style={styles.logo}>
-            <span style={styles.logoIcon}>⌂</span>
-            <span style={styles.logoText}>resume<em style={styles.logoAccent}>tailor</em></span>
+            <img src="/AdaptIQ_Logo.png" alt="AdaptIQ" style={{ height: 28, width: 'auto',borderRadius: '50%' }} />
+            <span style={styles.logoText}>Adapt<em style={styles.logoAccent}>IQ</em></span>
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
             <button
@@ -837,7 +937,38 @@ export default function App() {
               </svg>
               History
             </button>
-            <span style={styles.headerTag}>personal workspace</span>
+            {/* Workspace dropdown */}
+            <div style={{ position: 'relative' }}>
+              <button
+                onClick={() => setShowUserMenu(v => !v)}
+                className="workspace-btn"
+                style={{ display: 'flex', alignItems: 'center', gap: 6, background: 'none', border: '1px solid var(--border)', borderRadius: 6, cursor: 'pointer', color: 'var(--text-muted)', fontFamily: 'var(--font-mono)', fontSize: 11, letterSpacing: '0.08em', textTransform: 'uppercase', padding: '6px 11px' }}
+              >
+                Personal Workspace
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"
+                  style={{ transition: 'transform 0.2s', transform: showUserMenu ? 'rotate(180deg)' : 'rotate(0deg)' }}>
+                  <polyline points="6 9 12 15 18 9"/>
+                </svg>
+              </button>
+              {showUserMenu && (
+                <div style={{ position: 'absolute', right: 0, top: 'calc(100% + 8px)', background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 8, minWidth: 140, boxShadow: '0 8px 24px rgba(0,0,0,0.4)', zIndex: 100 }}
+                  onMouseLeave={() => setShowUserMenu(false)}
+                >
+                  <button
+                    onClick={() => { setShowUserMenu(false); handleLogout() }}
+                    className="signout-btn"
+                    style={{ display: 'flex', alignItems: 'center', gap: 8, width: '100%', padding: '10px 14px', background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-secondary)', fontFamily: 'var(--font-body)', fontSize: 13, textAlign: 'left', borderRadius: 8, transition: 'background 0.2s, color 0.2s' }}
+                  >
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
+                      <polyline points="16 17 21 12 16 7"/>
+                      <line x1="21" y1="12" x2="9" y2="12"/>
+                    </svg>
+                    Sign Out
+                  </button>
+                </div>
+              )}
+            </div>
           </div>
         </div>
       </header>
@@ -846,9 +977,11 @@ export default function App() {
       <main style={styles.main}>
 
         {/* Hero */}
-        <section style={styles.hero}>
-          <h1 style={styles.heroTitle}>Your Resume,<br /><em style={styles.heroItalic}>perfectly fitted.</em></h1>
-          <p style={styles.heroSub}>Upload your base resume and tailor it to any job description — automatically.</p>
+        <section style={{ ...styles.hero, position: 'relative' }}>
+          {/* Hero radial glow */}
+          <div style={{ position: 'absolute', top: '50%', left: '40%', transform: 'translate(-50%, -60%)', width: 600, height: 300, background: 'radial-gradient(ellipse, rgba(108,99,255,0.13) 0%, transparent 70%)', filter: 'blur(30px)', pointerEvents: 'none', zIndex: 0 }} />
+          <h1 style={{ ...styles.heroTitle, position: 'relative', zIndex: 1 }}>Your Resume,<br /><em style={styles.heroItalic}>perfectly fitted.</em></h1>
+          <p style={{ ...styles.heroSub, position: 'relative', zIndex: 1 }}>Upload your base resume and tailor it to any job description — automatically.</p>
         </section>
 
         {/* Upload Zone */}
@@ -998,7 +1131,7 @@ export default function App() {
 
           <button
             className="proceed-btn"
-            style={{ ...styles.proceedBtn, ...(selectedResume ? styles.proceedBtnActive : styles.proceedBtnDisabled) }}
+            className={selectedResume ? 'proceed-btn proceed-btn-active' : 'proceed-btn'} style={{ ...styles.proceedBtn, ...(selectedResume ? styles.proceedBtnActive : styles.proceedBtnDisabled) }}
             disabled={!selectedResume}
             onClick={() => selectedResume && setPage('tailor')}
           >
@@ -1029,7 +1162,7 @@ export default function App() {
               </div>
               <div style={styles.flowBody}>
                 <span style={styles.flowTitle}>Upload your resume</span>
-                <span style={styles.flowDesc}>Drop in your base PDF once — it stays saved for every job you apply to.</span>
+                <span style={styles.flowDesc}> Upload one or more base resumes — switch between them depending on the role you're targeting.</span>
               </div>
             </div>
 
@@ -1044,7 +1177,7 @@ export default function App() {
               </div>
               <div style={styles.flowBody}>
                 <span style={styles.flowTitle}>Paste a job link or description</span>
-                <span style={styles.flowDesc}>Drop in a URL or paste the job posting directly — either works. Optionally enable the cover letter toggle to generate one alongside your resume.</span>
+                <span style={styles.flowDesc}>Drop in a URL or paste the job posting directly. Optionally enable the cover letter toggle to generate one alongside your resume.</span>
               </div>
             </div>
 
@@ -1060,11 +1193,31 @@ export default function App() {
               </div>
               <div style={styles.flowBody}>
                 <span style={styles.flowTitle}>AI tailors your resume</span>
-                <span style={styles.flowDesc}>Keywords are matched, bullets sharpened, formatting stays intact. If cover letter is enabled, it's generated right after. Takes about 30–90s.</span>
+                <span style={styles.flowDesc}>Keywords are matched, bullets sharpened, formatting stays intact. If cover letter is enabled, it's generated right after. Takes about 10–20s.</span>
               </div>
             </div>
 
             <div style={styles.flowArrow}>↓</div>
+
+             <div style={styles.flowStep}>
+              <div style={styles.flowIcon}>
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                  <polyline points="7 10 12 15 17 10"/>
+                  <line x1="12" y1="15" x2="12" y2="3"/>
+                </svg>
+              </div>
+              <div style={styles.flowBody}>
+                <span style={styles.flowTitle}>Preview &amp; download</span>
+                <span style={styles.flowDesc}>View your tailored resume and cover letter side by side in the browser. Download either as a PDF when you're ready to apply.</span>
+              </div>
+            </div>
+            
+
+            <div style={styles.flowArrow}>↓</div>
+
+           
+
 
             <div style={styles.flowStep}>
               <div style={styles.flowIcon}>
@@ -1078,21 +1231,6 @@ export default function App() {
               </div>
             </div>
 
-            <div style={styles.flowArrow}>↓</div>
-
-            <div style={styles.flowStep}>
-              <div style={styles.flowIcon}>
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-                  <polyline points="7 10 12 15 17 10"/>
-                  <line x1="12" y1="15" x2="12" y2="3"/>
-                </svg>
-              </div>
-              <div style={styles.flowBody}>
-                <span style={styles.flowTitle}>Preview &amp; download</span>
-                <span style={styles.flowDesc}>View your tailored resume and cover letter side by side in the browser. Download either as a PDF when you're ready to apply.</span>
-              </div>
-            </div>
 
           </div>
         </section>
@@ -1100,7 +1238,7 @@ export default function App() {
       </main>
 
       <footer style={styles.footer}>
-        <span style={styles.footerText}>resume tailor · personal workspace</span>
+        <span style={styles.footerText}>AdaptIQ · personal workspace</span>
       </footer>
 
       {/* Resume preview panel */}
@@ -1232,10 +1370,7 @@ const styles = {
     alignItems: 'center',
     gap: 8,
   },
-  logoIcon: {
-    fontSize: 18,
-    color: 'var(--accent)',
-  },
+  logoIcon: { height: 28, width: 'auto' },
   logoText: {
     fontFamily: 'var(--font-display)',
     fontSize: 20,
@@ -1290,7 +1425,10 @@ const styles = {
   },
   heroItalic: {
     fontStyle: 'italic',
-    color: 'var(--accent)',
+    background: 'var(--accent-gradient)',
+    WebkitBackgroundClip: 'text',
+    WebkitTextFillColor: 'transparent',
+    backgroundClip: 'text',
   },
   heroSub: {
     fontSize: 16,
@@ -1326,7 +1464,7 @@ const styles = {
     color: 'var(--text-secondary)',
   },
   dropzone: {
-    border: '1.5px dashed var(--border)',
+    border: '1.5px dashed rgba(108,99,255,0.25)',
     borderRadius: 'var(--radius)',
     padding: '48px 24px',
     display: 'flex',
@@ -1335,7 +1473,7 @@ const styles = {
     gap: 10,
     cursor: 'pointer',
     transition: 'all 0.2s ease',
-    background: 'var(--surface)',
+    background: 'linear-gradient(145deg, #15172080 0%, var(--surface) 100%)',
     color: 'var(--text-secondary)',
     userSelect: 'none',
   },
@@ -1565,8 +1703,7 @@ const styles = {
     marginTop: 4,
   },
   proceedBtnActive: {
-    background: 'var(--accent)',
-    color: '#0e0f11',
+    background: 'var(--accent-gradient)', color: '#ffffff',
   },
   proceedBtnDisabled: {
     background: 'var(--surface-raised)',
