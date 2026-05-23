@@ -119,31 +119,7 @@ An AI-powered full-stack web application that helps users tailor their resumes t
 - `GET /api/gemini-quota`: Check API usage quota
 - `GET /api/download/{filename}`: Download generated files
 
-## Project Structure
 
-```
-AI-Resume-Tailor/
-├── backend/
-│   ├── main.py              # FastAPI application
-│   ├── requirements.txt     # Python dependencies
-│   ├── uploads/             # Uploaded resume PDFs
-│   ├── outputs/             # Generated tailored resumes
-│   └── output_cl/           # Generated cover letters
-├── frontend/
-│   ├── src/
-│   │   ├── App.jsx          # Main React component
-│   │   ├── TailorPage.jsx   # Resume tailoring interface
-│   │   ├── HistoryPage.jsx  # History view
-│   │   ├── LoadingScreen.jsx # Loading component
-│   │   ├── main.jsx         # React entry point
-│   │   └── index.css        # Styles
-│   ├── index.html
-│   ├── package.json
-│   └── vite.config.js       # Vite configuration
-├── .gitignore               # Git ignore rules
-├── api key.txt              # API key setup example (DO NOT USE)
-└── README.md                # This file
-```
 
 ## Development
 
