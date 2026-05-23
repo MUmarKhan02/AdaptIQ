@@ -1,5 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Request
 from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 import hmac
 import hashlib
@@ -2400,3 +2401,15 @@ def delete_resume(filename: str):
         raise HTTPException(status_code=404, detail="File not found.")
     file_path.unlink()
     return {"success": True, "deleted": filename}
+
+# ── Static file serving (production) ──────────────────────────────────────────
+FRONTEND_DIST = Path(__file__).parent.parent / "frontend" / "dist"
+
+if FRONTEND_DIST.exists():
+    app.mount("/assets", StaticFiles(directory=FRONTEND_DIST / "assets"), name="assets")
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    async def serve_frontend(full_path: str):
+        if full_path.startswith("api/"):
+            raise HTTPException(status_code=404)
+        return FileResponse(str(FRONTEND_DIST / "index.html"))
