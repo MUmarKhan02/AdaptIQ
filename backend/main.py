@@ -433,6 +433,9 @@ def assess_body_quality(body_text: str) -> tuple[bool, str]:
 
 @app.get("/")
 def root():
+    index = Path(__file__).parent.parent / "frontend" / "dist" / "index.html"
+    if index.exists():
+        return FileResponse(str(index))
     return {"message": "AdaptIQ API is running"}
 
 @app.post("/api/auth/login")
