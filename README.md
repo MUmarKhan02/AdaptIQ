@@ -2,6 +2,13 @@
 
 An AI-powered full-stack web application that helps users tailor their resumes to specific job descriptions using Google's Gemini AI. Upload your resume, paste a job description, and get a customized resume optimized for Applicant Tracking Systems (ATS).
 
+---
+
+## Live Demo
+[https://adaptiq-production.up.railway.app/](https://adaptiq-production.up.railway.app/)
+
+---
+
 ## ⚠️ Important Warnings
 
 ### API Key Security
