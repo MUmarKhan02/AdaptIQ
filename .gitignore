@@ -9,7 +9,7 @@ __pycache__/
 
 # Node
 node_modules/
-frontend/dist/
+
 
 # Logs
 *.log
