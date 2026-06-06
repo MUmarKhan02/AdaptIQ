@@ -15,5 +15,9 @@ frontend/dist/
 *.log
 
 # Resume files — personal data
+uploads/
+output_cl/
+outputs/
 backend/uploads/
 backend/outputs/
+backend/output_cl/
