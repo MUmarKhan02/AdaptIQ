@@ -2410,6 +2410,15 @@ FRONTEND_DIST = Path(__file__).parent.parent / "frontend" / "dist"
 
 if FRONTEND_DIST.exists():
     app.mount("/assets", StaticFiles(directory=FRONTEND_DIST / "assets"), name="assets")
+    app.mount("/static", StaticFiles(directory=FRONTEND_DIST), name="static")
+
+    @app.get("/AdaptIQ.png", include_in_schema=False)
+    async def serve_logo():
+        return FileResponse(str(FRONTEND_DIST / "AdaptIQ.png"))
+
+    @app.get("/AdaptIQ_Logo.png", include_in_schema=False)
+    async def serve_logo_small():
+        return FileResponse(str(FRONTEND_DIST / "AdaptIQ_Logo.png"))
 
     @app.get("/{full_path:path}", include_in_schema=False)
     async def serve_frontend(full_path: str):
