@@ -29,7 +29,7 @@ _AUTH_PASSWORD     = os.environ.get("ADAPTIQ_PASSWORD", "changeme")
 _AUTH_SECRET       = os.environ.get("ADAPTIQ_SECRET",   "adaptiq-secret-key-change-me")
 _TOKEN_EXPIRY_DAYS = 30
 _UNPROTECTED_PATHS = {"/", "/api/auth/login", "/api/gemini-quota"}
-_UNPROTECTED_PREFIXES = ("/api/download/", "/api/download-cl/")
+_UNPROTECTED_PREFIXES = ("/api/download/", "/api/download-cl/", "/api/preview-resume/")
 
 def _sign_token(payload: str) -> str:
     sig = hmac.new(_AUTH_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
