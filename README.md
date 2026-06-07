@@ -7,6 +7,10 @@ An AI-powered full-stack web application that helps users tailor their resumes t
 ## Live Demo
 [https://adaptiq-production.up.railway.app/](https://adaptiq-production.up.railway.app/)
 
+## Youtube Showcase Demo
+
+[![AdaptIQ](frontend/dist/AdaptIQ.png)](https://www.youtube.com/watch?v=3hyYeb9sAKI)
+
 ---
 
 ## ⚠️ Important Warnings
